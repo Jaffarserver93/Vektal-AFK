@@ -83,24 +83,34 @@ function isDisplayAlive(display) {
   } catch { return false; }
 }
 
+function killExistingXvfb(dispNum) {
+  try { execSync(`pkill -f "Xvfb :${dispNum}" 2>/dev/null || true`); } catch {}
+  try { execSync(`sleep 0.5`); } catch {}
+  try { execSync(`rm -f /tmp/.X${dispNum}-lock /tmp/.X${dispNum}-unix`); } catch {}
+}
+
 function startXvfb() {
+  const dispNum = DISPLAY_NUM.replace(":", "");
+
   if (process.env.DISPLAY) {
     if (isDisplayAlive(process.env.DISPLAY)) {
       log(`[Xvfb] DISPLAY=${process.env.DISPLAY} is active — skipping.`);
       return Promise.resolve(null);
     }
-    log(`[Xvfb] DISPLAY=${process.env.DISPLAY} set but not responding — cleaning stale lock and restarting...`);
-    const dispNum = process.env.DISPLAY.replace(":", "");
-    try { execSync(`rm -f /tmp/.X${dispNum}-lock`); } catch {}
+    log(`[Xvfb] DISPLAY=${process.env.DISPLAY} set but not responding — killing and restarting...`);
+    const existingDispNum = process.env.DISPLAY.replace(":", "");
+    killExistingXvfb(existingDispNum);
     delete process.env.DISPLAY;
   }
+
   if (!fs.existsSync(XVFB_PATH)) {
     log("[Xvfb] Not found — run: sudo apt-get install -y xvfb");
     return Promise.resolve(null);
   }
-  // Also clean any stale lock for our target display before starting
-  const dispNum = DISPLAY_NUM.replace(":", "");
-  try { execSync(`rm -f /tmp/.X${dispNum}-lock`); } catch {}
+
+  // Kill any existing Xvfb on our target display and remove stale locks
+  killExistingXvfb(dispNum);
+
   return new Promise((resolve, reject) => {
     log(`[Xvfb] Starting on display ${DISPLAY_NUM}...`);
     const xvfb = spawn(XVFB_PATH,
@@ -108,7 +118,12 @@ function startXvfb() {
       { stdio: ["ignore", "ignore", "pipe"], detached: false }
     );
     xvfb.on("error", (e) => { log(`[Xvfb] ERROR: ${e.message}`); reject(e); });
-    setTimeout(() => resolve(xvfb), 2000);
+    setTimeout(() => {
+      if (!isDisplayAlive(DISPLAY_NUM)) {
+        log(`[Xvfb] Warning: display ${DISPLAY_NUM} not responding after start`);
+      }
+      resolve(xvfb);
+    }, 2000);
   });
 }
 
@@ -623,15 +638,30 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   try {
     log("Launching browser (puppeteer-real-browser)...");
-    const result = await connect({
-      headless: false,
-      args: snap ? [...launcherDefaults, ...commonArgs] : [...commonArgs],
-      customConfig: { chromePath: chrome },
-      turnstile: true,
-      connectOption: { defaultViewport: { width: 1280, height: 900 } },
-      disableXvfb: true,
-      ignoreAllFlags: snap,
-    });
+    let result;
+    const BROWSER_RETRIES = 3;
+    for (let attempt = 1; attempt <= BROWSER_RETRIES; attempt++) {
+      try {
+        result = await connect({
+          headless: false,
+          args: snap ? [...launcherDefaults, ...commonArgs] : [...commonArgs],
+          customConfig: { chromePath: chrome },
+          turnstile: true,
+          connectOption: { defaultViewport: { width: 1280, height: 900 } },
+          disableXvfb: true,
+          ignoreAllFlags: snap,
+        });
+        break;
+      } catch (e) {
+        log(`[Browser] Launch attempt ${attempt}/${BROWSER_RETRIES} failed: ${e.message}`);
+        if (attempt < BROWSER_RETRIES) {
+          log(`[Browser] Retrying in 5s...`);
+          await sleep(5000);
+        } else {
+          throw e;
+        }
+      }
+    }
     browser = result.browser;
     page    = result.page;
     page.setDefaultNavigationTimeout(90000);

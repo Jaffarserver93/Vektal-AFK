@@ -109,10 +109,26 @@ echo "[5/5] Starting AFK bot with Xvfb virtual display..."
 echo "(Press Ctrl+C to stop)"
 echo ""
 
-# Kill any leftover Xvfb on our display
+# Kill any leftover Xvfb on display :94 and remove stale lock
+echo "Cleaning up any existing Xvfb on :94..."
+pkill -f "Xvfb :94" 2>/dev/null || true
+sleep 1
+rm -f /tmp/.X94-lock /tmp/.X94-unix
+
+# Start fresh Xvfb
 Xvfb :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
 XVFB_PID=$!
 sleep 2
+
+# Verify Xvfb actually started
+if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+  echo "[ERROR] Xvfb failed to start. Trying to remove stale lock and retry..."
+  rm -f /tmp/.X94-lock /tmp/.X94-unix
+  Xvfb :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
+  XVFB_PID=$!
+  sleep 2
+fi
+
 export DISPLAY=:94
 
 echo "Display: $DISPLAY | Chrome: $CHROMIUM_PATH"
