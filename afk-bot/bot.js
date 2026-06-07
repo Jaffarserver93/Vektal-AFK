@@ -647,8 +647,10 @@ async function runLinkPaysCycle(page, cycleNum) {
   // ── STEP 5: Ad page loop (max 4 pages) ──────────────────────────────
   log("\n── STEP 5: Ad page loop ──");
   const MAX_AD_PAGES = 4;
-  let adPagesDone = 0, prevLoopUrl = "", sameStreak = 0;
-  for (let i = 1; i <= 30; i++) {
+  const AD_DOMAINS   = ["evspec.in", "rank1st.in", "savepe.in", "bookyourhotel.in"];
+  let adPagesDone = 0, prevLoopUrl = "", sameStreak = 0, totalStuckMs = 0;
+
+  for (let i = 1; i <= 40; i++) {
     const u = page.url();
     log(`\n  [loop ${i}] URL: ${u}`);
 
@@ -665,19 +667,43 @@ async function runLinkPaysCycle(page, cycleNum) {
       continue;
     }
 
-    // Once 4 ad pages are done, just wait for bookyourhotel.in redirect
+    // Once 4 ad pages are done, wait for bookyourhotel.in redirect
+    // If stuck >3min after that, navigate directly
     if (adPagesDone >= MAX_AD_PAGES) {
-      log(`  ✅ ${MAX_AD_PAGES} ad pages complete — waiting for bookyourhotel.in redirect...`);
+      totalStuckMs += 3000;
+      if (totalStuckMs >= 180_000) {
+        log(`  ⚠️  Still not on bookyourhotel.in after ${totalStuckMs / 1000}s — navigating directly...`);
+        await safeGoto(page, "https://bookyourhotel.in/", 30000);
+        break;
+      }
+      log(`  ✅ ${MAX_AD_PAGES} ad pages complete — waiting for bookyourhotel.in redirect... (${totalStuckMs / 1000}s)`);
       await sleep(3000);
       continue;
     }
 
-    const isAd = await page.evaluate(() => !!(
+    // Check for tp- ad elements — wait up to 12s for them to appear before giving up
+    let isAd = await page.evaluate(() => !!(
       document.querySelector("button.tp-unlock-btn") ||
       document.querySelector("button.tp-btn") ||
       document.querySelector(".tp-unlock-btn") ||
       document.querySelector("[class*='tp-']")
     )).catch(() => false);
+
+    if (!isAd && AD_DOMAINS.some((d) => u.includes(d))) {
+      log(`  No tp- elements yet on ad domain — waiting up to 12s for page to finish loading...`);
+      for (let w = 0; w < 12; w++) {
+        await sleep(1000);
+        isAd = await page.evaluate(() => !!(
+          document.querySelector("button.tp-unlock-btn") ||
+          document.querySelector("button.tp-btn") ||
+          document.querySelector(".tp-unlock-btn") ||
+          document.querySelector("[class*='tp-']")
+        )).catch(() => false);
+        if (isAd) { log(`  tp- elements appeared after ${w + 1}s ✓`); break; }
+        // Also break early if URL changed
+        if (page.url() !== u) { log(`  URL changed during wait — continuing loop`); break; }
+      }
+    }
 
     if (isAd) {
       sameStreak = 0;
@@ -685,10 +711,23 @@ async function runLinkPaysCycle(page, cycleNum) {
       log(`  → Ad page ${adPagesDone}/${MAX_AD_PAGES}`);
       await handleAdPage(page, `p${adPagesDone}`);
     } else {
-      if (u === prevLoopUrl) {
+      // On a known ad domain but tp- never appeared — treat as ad page, try buttons anyway
+      if (AD_DOMAINS.some((d) => u.includes(d)) && u === prevLoopUrl) {
         sameStreak++;
+        if (sameStreak >= 3) {
+          log(`  ⚠️  Stuck on ad domain ${sameStreak}× — force-handling as ad page...`);
+          adPagesDone++;
+          await handleAdPage(page, `p${adPagesDone}-forced`);
+          sameStreak = 0;
+          continue;
+        }
+      } else if (u !== prevLoopUrl) {
+        sameStreak = 0;
+      } else {
+        sameStreak++;
+        // Hard reload if very stuck (non-ad domain)
         if (sameStreak >= 5) {
-          log(`  ⚠️  Stuck on same URL (${sameStreak}×) — reloading...`);
+          log(`  ⚠️  Stuck on same non-ad URL (${sameStreak}×) — reloading...`);
           await Promise.race([
             page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {}),
             new Promise((r) => setTimeout(r, 18000)),
@@ -697,11 +736,9 @@ async function runLinkPaysCycle(page, cycleNum) {
           await sleep(3000);
           continue;
         }
-      } else {
-        sameStreak = 0;
       }
-      const waitMs = sameStreak > 0 ? 8000 : 5000;
-      log(`  Not an ad page (streak: ${sameStreak}) — waiting ${waitMs / 1000}s for auto-redirect...`);
+      const waitMs = sameStreak > 0 ? 6000 : 4000;
+      log(`  Not an ad page (streak: ${sameStreak}) — waiting ${waitMs / 1000}s...`);
       await sleep(waitMs);
     }
     prevLoopUrl = u;
