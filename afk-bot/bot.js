@@ -344,23 +344,46 @@ async function runLinkPaysCycle(page, cycleNum) {
   log(`proceed() called: ${called}`);
 
   // Wait for ad site
-  const adUrl = await waitForUrl(page, ["evspec.in","rank1st.in","savepe.in","bookyourhotel.in","earn/linkpays/complete"], 30000, "ad-site");
-  if (!adUrl) { log(`WARNING: Did not reach ad site (current: ${page.url()})`); return { success: false, waitMs: 30000 }; }
+  let adUrl = await waitForUrl(page, ["evspec.in","rank1st.in","savepe.in","bookyourhotel.in","earn/linkpays/complete"], 30000, "ad-site");
+  if (!adUrl) {
+    const u = page.url();
+    log(`WARNING: Did not reach ad site (current: ${u})`);
+    if (u.includes("linkpays.in")) {
+      // Fallback: try clicking "Continue to next step" if stuck on linkpays
+      log("  Still on linkpays.in — trying Continue button...");
+      await clickButton(page, ["button.btn","a.btn",".btn"], ["continue","next step"]);
+      await sleep(5000);
+      adUrl = page.url();
+      log(`  After continue click: ${adUrl}`);
+      if (!adUrl || (!adUrl.includes("evspec.in") && !adUrl.includes("rank1st.in") && !adUrl.includes("bookyourhotel.in"))) {
+        return { success: false, waitMs: 30000 };
+      }
+    } else {
+      return { success: false, waitMs: 30000 };
+    }
+  }
   log(`✓ Ad site: ${adUrl}`);
 
   // Loop through ad pages
   let adsDone = 0, prevUrl = "";
   for (let i = 1; i <= 20; i++) {
     const u = page.url();
+    log(`  [loop ${i}] URL: ${u}`);
+
     if (u.includes("vektalnodes.in")) { log("✓ Back on vektalnodes.in"); break; }
     if (u.includes("bookyourhotel.in")) { log("→ bookyourhotel.in reached"); break; }
     if (u.includes("#google_vignette") || u.includes("google_vignette")) {
-      for (let j = 0; j < 10; j++) { await sleep(1000); if (!page.url().includes("google_vignette")) break; }
+      log("  Google vignette — waiting up to 10s for auto-redirect...");
+      for (let j = 0; j < 10; j++) {
+        await sleep(1000);
+        if (!page.url().includes("google_vignette")) { log(`  → Redirected to: ${page.url()}`); break; }
+      }
       continue;
     }
 
     const isAd = await page.evaluate(() => !!(
       document.querySelector("button.tp-unlock-btn") ||
+      document.querySelector(".tp-unlock-btn") ||
       document.querySelector("button.tp-btn") ||
       document.querySelector("[class*='tp-']")
     )).catch(() => false);
@@ -370,7 +393,7 @@ async function runLinkPaysCycle(page, cycleNum) {
       await handleAdPage(page, adsDone);
     } else {
       const waitMs = u === prevUrl ? 8000 : 5000;
-      log(`  [loop ${i}] Not ad page — waiting ${waitMs / 1000}s...`);
+      log(`  Not an ad page — waiting ${waitMs / 1000}s for auto-redirect...`);
       await sleep(waitMs);
     }
     prevUrl = u;
@@ -424,8 +447,20 @@ async function runLinkPaysCycle(page, cycleNum) {
   await sleep(5000);
   if (!page.url().includes("vektalnodes.in/earn")) {
     log("Navigating to /earn to confirm coin credit...");
-    await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
-    await waitForCF(page, 30000);
+    try {
+      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await waitForCF(page, 30000);
+    } catch (navErr) {
+      // ERR_ABORTED can happen if a redirect races the navigation — wait and retry once
+      log(`  Nav to /earn got: ${navErr.message.split("\n")[0]} — retrying in 5s...`);
+      await sleep(5000);
+      try {
+        await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
+        await waitForCF(page, 30000);
+      } catch (e2) {
+        log(`  Retry also failed (${e2.message.split("\n")[0]}) — reading current page as-is`);
+      }
+    }
   }
   await sleep(2000);
 
