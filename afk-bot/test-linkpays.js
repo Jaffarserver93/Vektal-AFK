@@ -317,6 +317,15 @@ async function handleAdPage(page, label) {
       if (page.url().includes("/login")) throw new Error("Login failed — still on /login");
     }
     log(`✓ Logged in: ${page.url()}`);
+
+    // Always navigate explicitly to /earn
+    if (!page.url().includes("/earn")) {
+      log("  Navigating to /earn...");
+      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await waitForCF(page);
+      await sleep(1000);
+    }
+    log(`  On earn page: ${page.url()}`);
     await shot(page, "earn-page");
 
     // Check coins before
@@ -393,7 +402,9 @@ async function handleAdPage(page, label) {
 
     // ── STEP 5: Loop through ad pages ─────────────────────────────────────
     log("\n── STEP 5: Ad page loop ──");
-    for (let i = 1; i <= 6; i++) {
+    let adPagesDone = 0;
+    let prevLoopUrl = "";
+    for (let i = 1; i <= 20; i++) {
       const u = page.url();
       log(`\n  [loop ${i}] URL: ${u}`);
 
@@ -405,13 +416,17 @@ async function handleAdPage(page, label) {
         log("  → On bookyourhotel.in — jumping to gateway step");
         break;
       }
-      // Google vignette auto-redirects
-      if (u.includes("google_vignette") || u.includes("google.com/url")) {
-        log("  Google vignette — waiting 8s for auto-redirect...");
-        await sleep(8000);
+      // Google vignette: wait for the auto-redirect
+      if (u.includes("#google_vignette") || u.includes("google_vignette")) {
+        log("  Google vignette — waiting up to 10s for auto-redirect...");
+        for (let j = 0; j < 10; j++) {
+          await sleep(1000);
+          const nu = page.url();
+          if (!nu.includes("google_vignette")) { log(`  → Redirected to: ${nu}`); break; }
+        }
         continue;
       }
-      // Ad pages: rank1st.in, evspec.in, savepe.in, etc.
+      // Detect ad pages (tp- widget buttons)
       const isAd = await page.evaluate(() => !!(
         document.querySelector("button.tp-unlock-btn") ||
         document.querySelector("button.tp-btn") ||
@@ -420,11 +435,15 @@ async function handleAdPage(page, label) {
       )).catch(() => false);
 
       if (isAd) {
-        await handleAdPage(page, `p${i}`);
+        adPagesDone++;
+        await handleAdPage(page, `p${adPagesDone}`);
       } else {
-        log("  Not an ad page — waiting 6s for auto-redirect...");
-        await sleep(6000);
+        // If URL same as previous iteration, page may be slow — wait longer
+        const waitMs = u === prevLoopUrl ? 8000 : 5000;
+        log(`  Not an ad page — waiting ${waitMs / 1000}s for auto-redirect...`);
+        await sleep(waitMs);
       }
+      prevLoopUrl = u;
     }
 
     // ── STEP 6: bookyourhotel.in — Get Link ──────────────────────────────
@@ -440,18 +459,53 @@ async function handleAdPage(page, label) {
     if (onHotel) {
       log(`  On bookyourhotel.in: ${page.url()}`);
       await shot(page, "hotel-start");
-      // Wait 30s countdown minimum
-      await waitForCountdown(page, 40000, "hotel", 30000);
+
+      // Wait for bookyourhotel countdown (30s minimum)
+      await waitForCountdown(page, 50000, "hotel", 30000);
+
+      // Also enforce 240s total minimum from the very start of the flow
+      const elapsedTotal = Math.floor((Date.now() - startTime) / 1000);
+      const minRequired = 245;
+      if (elapsedTotal < minRequired) {
+        const stillNeeded = (minRequired - elapsedTotal) * 1000;
+        log(`  Total elapsed: ${elapsedTotal}s — waiting ${minRequired - elapsedTotal}s more for 240s server minimum...`);
+        await sleep(stillNeeded, "server 240s minimum");
+      } else {
+        log(`  Total elapsed: ${elapsedTotal}s — past 240s minimum ✓`);
+      }
+
       await shot(page, "hotel-after-wait");
 
-      // Click Get Link
-      const gotLink = await clickButton(
-        page,
-        ["button.tp-btn", "#get-link", ".get-link", "a.btn"],
-        ["get link", "get links", "claim", "proceed", "continue"],
-        "Get Link",
-      );
-      await sleep(5000);
+      // Click "GET LINK" — use only very specific text to avoid wrong buttons
+      const gotLink = await page.evaluate(() => {
+        const all = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
+        for (const el of all) {
+          const txt = ((el.innerText || el.value || el.textContent) || "").trim().toLowerCase();
+          if (txt === "get link" || txt === "get links" || txt === "getlink") {
+            el.click();
+            return el.innerText || el.value || txt;
+          }
+        }
+        // Wider fallback: text starts with "get"
+        for (const el of all) {
+          const txt = ((el.innerText || el.value || el.textContent) || "").trim().toLowerCase();
+          if (txt.startsWith("get link")) {
+            el.click();
+            return el.innerText || el.value || txt;
+          }
+        }
+        return null;
+      });
+      if (gotLink) log(`  ✓ Clicked Get Link: "${gotLink}"`);
+      else log("  ✗ Get Link button not found by text — trying CSS...");
+
+      if (!gotLink) {
+        // CSS fallback: look for a button with "get" in class or id
+        await clickButton(page, ["#get-link", ".get-link-btn", "[id*='get']", "[class*='get-link']"], [], "Get Link CSS");
+      }
+
+      log("  Waiting for redirect after Get Link...");
+      await sleep(8000);
       log(`  After Get Link: ${page.url()}`);
       await shot(page, "hotel-after-get-link");
     }
@@ -462,11 +516,15 @@ async function handleAdPage(page, label) {
     log(`  Final URL: ${finalUrl}`);
     await shot(page, "final-url");
 
+    // Wait for any final redirect
+    await sleep(5000);
+    log(`  URL after wait: ${page.url()}`);
+
     // Navigate to /earn to verify coins
-    await sleep(3000);
     if (!page.url().includes("vektalnodes.in/earn")) {
-      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await waitForCF(page);
+      log("  Navigating to /earn to check coins...");
+      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await waitForCF(page, 30000);
     }
     await sleep(2000);
 
