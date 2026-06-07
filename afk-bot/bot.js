@@ -342,12 +342,16 @@ async function runLinkPaysCycle(page, cycleNum) {
   const status = await getLinkPaysStatus(page);
   log(`Coins before: ${coinsBefore} | LP: available=${status.available} usage=${status.usageToday}/${status.maxUsage} cooldown=${status.cooldownSec}s`);
 
+  // Respect cooldown even if button appears enabled (slot not open yet)
+  if (status.cooldownSec > 0) {
+    const h = Math.floor(status.cooldownSec / 3600);
+    const m = Math.floor((status.cooldownSec % 3600) / 60);
+    log(`⏳ Next slot opens in ${h}h ${m}m — sleeping until ${new Date(Date.now() + status.cooldownSec * 1000).toLocaleTimeString()}`);
+    return { success: false, waitMs: (status.cooldownSec + 30) * 1000 };
+  }
+
   if (!status.available) {
-    if (status.cooldownSec > 0) {
-      log(`Cooldown active — ${status.cooldownSec}s remaining. Skipping cycle.`);
-      return { success: false, waitMs: (status.cooldownSec + 10) * 1000 };
-    }
-    log("LinkPays not available (daily limit or disabled).");
+    log("LinkPays not available (daily limit hit or disabled).");
     return { success: false, waitMs: 0 };
   }
 
