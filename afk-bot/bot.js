@@ -65,7 +65,53 @@ async function shot(page, label) {
     ]);
     log(`  📸 ${path.basename(file)}`);
   } catch (e) {
+    // "Internal error" means the renderer crashed — try a viewport-only screenshot as fallback
+    if (e.message && e.message.includes("Internal error")) {
+      log(`  📸 renderer crashed — trying viewport-only fallback...`);
+      try {
+        await Promise.race([
+          page.screenshot({ path: file, fullPage: false }),
+          new Promise((_, r) => setTimeout(() => r(new Error("screenshot timeout")), 8000)),
+        ]);
+        log(`  📸 ${path.basename(file)} (viewport-only)`);
+        return;
+      } catch (e2) {
+        log(`  📸 fallback also failed (${e2.message}) — page renderer is dead, will reload`);
+        try {
+          await Promise.race([
+            page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }),
+            new Promise((r) => setTimeout(r, 33000)),
+          ]);
+          log(`  📸 page reloaded after renderer crash`);
+        } catch {}
+        return;
+      }
+    }
     log(`  📸 screenshot skipped (${e.message})`);
+  }
+}
+
+// ── ensurePageAlive — reload if renderer crashed after a long CF wait ──────────
+async function ensurePageAlive(page, url) {
+  try {
+    // A simple evaluate confirms the renderer is alive
+    await Promise.race([
+      page.evaluate(() => document.readyState),
+      new Promise((_, r) => setTimeout(() => r(new Error("renderer dead")), 5000)),
+    ]);
+  } catch (e) {
+    log(`  [health] Renderer unresponsive (${e.message}) — reloading page...`);
+    try {
+      const target = url || page.url();
+      await Promise.race([
+        page.goto(target, { waitUntil: "domcontentloaded", timeout: 45000 }),
+        new Promise((r) => setTimeout(r, 48000)),
+      ]);
+      log(`  [health] Page reloaded ✓ — ${page.url()}`);
+      await waitForCF(page, 60000);
+    } catch (e2) {
+      log(`  [health] Reload also failed: ${e2.message}`);
+    }
   }
 }
 function resetStepNum() { _stepNum = 0; }
@@ -417,6 +463,7 @@ async function runLinkPaysCycle(page, cycleNum) {
   await safeGoto(page, `${SITE}/earn`, 60000);
   log("  [step1] page landed — waiting for CF...");
   await waitForCF(page);
+  await ensurePageAlive(page, `${SITE}/earn`);
   await ensureLoggedIn(page);
   await sleep(1000);
   log("  [step1] taking screenshot...");
