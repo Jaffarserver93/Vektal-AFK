@@ -1,365 +1,509 @@
+/**
+ * test-linkpays.js
+ *
+ * Tests the full LinkPays earn flow using puppeteer-real-browser
+ * (bypasses Cloudflare Turnstile) + Xvfb for virtual display.
+ *
+ * Full chain:
+ *   /earn → click "Open LinkPays"
+ *     → POST /earn/linkpays/start → 302 → linkpays.in/VEKTALNODES_COINS (MAIN TAB)
+ *     → proceed() fires after 3.5s → ad site (evspec.in / rank1st.in)
+ *     → 4 ad pages (countdown + I'm Not Robot + Verify + Continue each)
+ *     → bookyourhotel.in → wait 30s → Get Link
+ *     → linkpays.in/VEKTALNODES_COINS → vektalnodes.in/earn/linkpays/complete?token=...
+ *     → 12 coins credited ✅
+ */
+
 require("dotenv").config();
-const puppeteer = require("puppeteer");
-const { execSync } = require("child_process");
+const { connect } = require("puppeteer-real-browser");
+const { spawn, execSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 
-const SCREENSHOTS_DIR = path.join(__dirname, "screenshots");
-if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR);
+const SITE = "https://vektalnodes.in";
+const EMAIL = process.env.EMAIL || process.env.VEKTAL_EMAIL || "";
+const PASSWORD = process.env.PASSWORD || process.env.VEKTAL_PASSWORD || "";
+const DISPLAY_NUM = ":94";
+const XVFB_PATH = "/usr/bin/Xvfb";
 
-const CHROME_ARGS = [
-  "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-  "--disable-gpu", "--disable-accelerated-2d-canvas", "--no-first-run",
-  "--no-zygote", "--single-process", "--disable-extensions",
-  "--disable-background-networking", "--disable-default-apps",
-  "--disable-sync", "--disable-translate", "--hide-scrollbars",
-  "--mute-audio", "--window-size=1280,800",
-];
+if (!EMAIL || !PASSWORD) {
+  console.error("ERROR: EMAIL and PASSWORD must be set in .env");
+  process.exit(1);
+}
+
+const SCREENSHOTS_DIR = path.join(__dirname, "screenshots");
+if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+
+function ts() { return new Date().toLocaleTimeString(); }
+function log(msg) { console.log(`[${ts()}] ${msg}`); }
+async function sleep(ms, label) {
+  if (label) log(`  ⏳ Waiting ${Math.round(ms / 1000)}s — ${label}...`);
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+let stepNum = 0;
+async function shot(page, label) {
+  stepNum++;
+  const file = path.join(SCREENSHOTS_DIR, `${String(stepNum).padStart(2, "0")}-${label}.png`);
+  try { await page.screenshot({ path: file, fullPage: true }); log(`  📸 ${path.basename(file)}`); } catch {}
+}
 
 function findChrome() {
   if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
   const candidates = [
-    "/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium",
-    "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/google-chrome",
+    "/usr/local/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
   ];
-  for (const p of candidates) { try { execSync(`test -x "${p}"`); return p; } catch {} }
+  for (const p of candidates) {
+    try { execSync(`test -x "${p}"`); return p; } catch {}
+  }
   for (const cmd of ["google-chrome-stable", "google-chrome", "chromium"]) {
-    try { const p = execSync(`which ${cmd} 2>/dev/null`).toString().trim(); if (p && !p.includes("snap")) return p; } catch {}
+    try {
+      const p = execSync(`which ${cmd} 2>/dev/null`).toString().trim();
+      if (p) return p;
+    } catch {}
   }
   return null;
 }
 
-let stepNum = 0;
-function log(msg) { console.log(`[${new Date().toLocaleTimeString()}] ${msg}`); }
-async function sleep(ms, label) {
-  if (label) log(`  ⏳ Waiting ${ms / 1000}s — ${label}...`);
-  return new Promise((r) => setTimeout(r, ms));
-}
-async function shot(page, label) {
-  stepNum++;
-  const file = path.join(SCREENSHOTS_DIR, `${String(stepNum).padStart(2, "0")}-${label}.png`);
-  try { await page.screenshot({ path: file, fullPage: true }); } catch {}
-  log(`  📸 ${path.basename(file)}`);
+function isSnapChromium(chromePath) {
+  if (!chromePath) return false;
+  if (chromePath.includes("/snap/")) return true;
+  try {
+    const resolved = execSync(`readlink -f "${chromePath}" 2>/dev/null || echo ""`).toString().trim();
+    if (resolved.includes("/snap/")) return true;
+    const head = execSync(`head -5 "${chromePath}" 2>/dev/null || echo ""`).toString();
+    return head.includes("/snap/");
+  } catch { return false; }
 }
 
-async function waitForVisible(page, selector, timeout = 30000) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    const visible = await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      return el && el.offsetParent !== null;
-    }, selector).catch(() => false);
-    if (visible) return true;
+function startXvfb() {
+  if (process.env.DISPLAY) {
+    log(`[Xvfb] DISPLAY already set to ${process.env.DISPLAY} — skipping.`);
+    return Promise.resolve(null);
+  }
+  if (!fs.existsSync(XVFB_PATH)) {
+    log("[Xvfb] Not found at /usr/bin/Xvfb — run: sudo apt-get install -y xvfb");
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve, reject) => {
+    log(`[Xvfb] Starting on display ${DISPLAY_NUM}...`);
+    const xvfb = spawn(XVFB_PATH, [DISPLAY_NUM, "-screen", "0", "1280x900x24", "-ac", "+extension", "GLX", "+render", "-noreset"], {
+      stdio: ["ignore", "ignore", "pipe"], detached: false,
+    });
+    xvfb.on("error", (err) => {
+      log(`[Xvfb] ERROR: ${err.message}`);
+      reject(err);
+    });
+    setTimeout(() => resolve(xvfb), 2000);
+  });
+}
+
+async function waitForCF(page, ms = 90000) {
+  const dl = Date.now() + ms;
+  while (Date.now() < dl) {
+    const title = await page.title().catch(() => "");
+    const url = page.url();
+    if (!title.toLowerCase().includes("just a moment") && !url.includes("cdn-cgi/challenge")) return;
+    log(`  [CF] Cloudflare challenge active — waiting...`);
+    await sleep(2000);
+  }
+  log("  [CF] Warning: challenge may not have cleared.");
+}
+
+async function waitForUrl(page, matches, timeoutMs = 60000, label = "") {
+  const dl = Date.now() + timeoutMs;
+  let prev = "";
+  while (Date.now() < dl) {
+    const u = page.url();
+    if (u !== prev) { log(`  ${label ? "[" + label + "] " : ""}URL → ${u}`); prev = u; }
+    if (matches.some((m) => u.includes(m))) return u;
+    await sleep(800);
+  }
+  throw new Error(`Timeout waiting for [${matches.join(", ")}]. Current: ${page.url()}`);
+}
+
+async function readCountdown(page) {
+  return page.evaluate(() => {
+    const doc = document;
+    const candidates = [
+      doc.querySelector("#timer"), doc.querySelector("#countdown"),
+      doc.querySelector(".timer"), doc.querySelector(".countdown"),
+      doc.querySelector("[id*='timer']"), doc.querySelector("[id*='count']"),
+      doc.querySelector("[class*='timer']"), doc.querySelector("[class*='count']"),
+    ];
+    for (const el of candidates) {
+      if (!el) continue;
+      const n = parseInt((el.innerText || el.textContent || "").trim(), 10);
+      if (!isNaN(n) && n >= 0) return n;
+    }
+    return 0;
+  }).catch(() => 0);
+}
+
+async function waitForCountdown(page, maxMs = 45000, label = "", minMs = 15000) {
+  const prefix = label ? `[${label}] ` : "";
+  await sleep(1500);
+  const dl = Date.now() + maxMs;
+  const minDl = Date.now() + minMs;
+  let last = -1;
+  let seen = false;
+  while (Date.now() < dl) {
+    const secs = await readCountdown(page);
+    if (secs !== last) { log(`  ${prefix}Countdown: ${secs}s`); last = secs; }
+    if (secs > 0) seen = true;
+    if (secs <= 0 && Date.now() >= minDl) return;
     await sleep(1000);
   }
-  return false;
+  if (!seen) log(`  ${prefix}No countdown found — used ${minMs / 1000}s floor.`);
 }
 
-async function clickSelector(page, selector, label) {
-  try {
-    const el = await page.$(selector);
-    if (el) {
-      await el.scrollIntoView().catch(() => {});
-      await el.click();
-      log(`  ✓ Clicked ${label} (${selector})`);
-      return true;
-    }
-  } catch {}
-  log(`  ✗ ${label} not found (${selector})`);
-  return false;
-}
-
-// Handles one ad-page that has tp-unlock-btn / tp-btn pattern
-async function handleAdPage(page, label) {
-  log(`\n── Ad page [${label}] — ${page.url()} ──`);
-  await shot(page, `adpage-${label}-start`);
-
-  // Wait up to 25s for the "I'M Not Robot" button to appear
-  log("  Waiting up to 25s for timer + 'I'M Not Robot' button...");
-  const notRobotVisible = await waitForVisible(page, "button.tp-unlock-btn", 25000);
-
-  if (notRobotVisible) {
-    log("  'I'M Not Robot' button is visible!");
-    await clickSelector(page, "button.tp-unlock-btn", "I'M Not Robot");
-    await sleep(2000);
-    await shot(page, `adpage-${label}-after-notrobot`);
-  } else {
-    log("  'I'M Not Robot' button did NOT appear — skipping.");
-  }
-
-  // Scroll to bottom to reveal hidden buttons
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await sleep(1500);
-  await shot(page, `adpage-${label}-scrolled`);
-
-  // Wait for Verify button
-  const verifyVisible = await waitForVisible(page, "button.tp-btn.tp-blue", 10000);
-  if (verifyVisible) {
-    // Click Verify (first tp-btn)
-    const tpBtns = await page.$$("button.tp-btn.tp-blue");
-    for (const btn of tpBtns) {
-      const txt = (await btn.evaluate((el) => el.innerText)).toLowerCase();
-      if (txt.includes("verify")) {
-        await btn.click();
-        log("  ✓ Clicked Verify button");
-        await sleep(2000);
-        break;
+async function clickButton(page, selectors, textMatches, label = "") {
+  const result = await page.evaluate(
+    (sels, texts) => {
+      for (const sel of sels) {
+        try {
+          const el = document.querySelector(sel);
+          if (el && !el.disabled) { el.click(); return sel; }
+        } catch {}
       }
-    }
-    await shot(page, `adpage-${label}-after-verify`);
-
-    // Click Continue button
-    const tpBtns2 = await page.$$("button.tp-btn.tp-blue");
-    for (const btn of tpBtns2) {
-      const txt = (await btn.evaluate((el) => el.innerText)).toLowerCase();
-      if (txt.includes("continue")) {
-        await btn.click();
-        log("  ✓ Clicked Continue button");
-        await sleep(4000);
-        break;
-      }
-    }
-  } else {
-    // No tp-btn — look for any continue link
-    log("  No tp-btn found — looking for any 'Continue' link...");
-    const found = await page.evaluate(() => {
-      const all = document.querySelectorAll("a, button");
-      for (const el of all) {
-        const txt = (el.innerText || "").trim().toLowerCase();
-        if (txt === "continue" || txt === "next" || txt === "proceed") {
-          el.click();
-          return el.innerText;
+      const clickables = Array.from(document.querySelectorAll("button, a, input[type=submit], [role=button]"));
+      for (const el of clickables) {
+        const text = (el.innerText || el.value || "").toLowerCase();
+        if (texts.some((t) => text.includes(t.toLowerCase()))) {
+          if (!el.disabled) { el.click(); return "text:" + el.innerText.trim().slice(0, 40); }
         }
       }
       return null;
-    });
-    if (found) log(`  ✓ Clicked fallback: ${found}`);
-    else log("  ✗ No continue button found on this page");
-    await sleep(4000);
-  }
-
-  log(`  → After continue: ${page.url()}`);
-  await shot(page, `adpage-${label}-after-continue`);
+    },
+    selectors,
+    textMatches,
+  ).catch(() => null);
+  if (result) log(`  ✓ Clicked ${label} (${result})`);
+  else log(`  ✗ ${label} not found`);
+  return !!result;
 }
 
-async function isAdPage(page) {
-  return page.evaluate(() => {
-    return !!(
-      document.querySelector("button.tp-unlock-btn") ||
-      document.querySelector("button.tp-btn") ||
-      document.querySelector(".tp-unlock-btn") ||
-      document.querySelector("[class*='tp-']")
-    );
-  }).catch(() => false);
+async function handleAdPage(page, label) {
+  log(`\n── Ad page [${label}] — ${page.url()} ──`);
+  await shot(page, `ad-${label}-start`);
+
+  // Wait for countdown timer (15s minimum)
+  await waitForCountdown(page, 35000, label, 15000);
+  await shot(page, `ad-${label}-after-countdown`);
+
+  // Scroll to reveal any hidden buttons
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+  await sleep(800);
+
+  // Click "I'm Not Robot" if it appears
+  const notRobot = await clickButton(page, ["button.tp-unlock-btn", ".tp-unlock-btn"], ["not robot", "i'm not", "human"], "I'm Not Robot");
+  if (notRobot) await sleep(2000);
+
+  // Scroll again
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+  await sleep(600);
+  await shot(page, `ad-${label}-pre-verify`);
+
+  // Click Verify button
+  const verified = await clickButton(page, ["button.tp-btn.tp-blue", "button.tp-btn"], ["verify", "verifiy"], "Verify");
+  if (verified) await sleep(1500);
+
+  // Click Continue button
+  await clickButton(page, ["button.tp-btn.tp-blue", "button.tp-btn", ".tp-btn"], ["continue", "next", "proceed"], "Continue");
+  await sleep(3000);
+
+  log(`  → After ad page: ${page.url()}`);
+  await shot(page, `ad-${label}-done`);
 }
 
+// ── MAIN ─────────────────────────────────────────────────────────────────────
 (async () => {
   const startTime = Date.now();
-  log("=== LinkPays Bypass Test v3 ===");
+  log("=== LinkPays Test (puppeteer-real-browser) ===");
 
   const chrome = findChrome();
-  if (!chrome) { log("No Chrome found."); process.exit(1); }
-  log(`Chrome: ${chrome}`);
+  if (!chrome) { log("ERROR: No Chrome/Chromium found. Run start.sh to install."); process.exit(1); }
+  const snap = isSnapChromium(chrome);
+  log(`Chrome: ${chrome} (snap: ${snap})`);
 
-  const browser = await puppeteer.launch({ headless: "new", executablePath: chrome, args: CHROME_ARGS });
-  const earnPage = await browser.newPage();
-  await earnPage.setViewport({ width: 1280, height: 800 });
-  earnPage.setDefaultNavigationTimeout(90000);
-  await earnPage.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
-  earnPage.on("dialog", async (d) => { log(`Dialog: ${d.message()}`); await d.dismiss(); });
+  // Start Xvfb for virtual display
+  const xvfb = await startXvfb().catch((e) => { log(`Xvfb failed: ${e.message} — continuing without`); return null; });
+  if (!process.env.DISPLAY && xvfb) process.env.DISPLAY = DISPLAY_NUM;
+  log(`DISPLAY=${process.env.DISPLAY || "(none)"}`);
+
+  const commonArgs = [
+    "--disable-dev-shm-usage", "--disable-gpu", "--disable-software-rasterizer",
+    "--no-first-run", "--no-default-browser-check", "--window-size=1280,900",
+    "--no-sandbox", "--disable-setuid-sandbox",
+  ];
+  const launcherDefaults = [
+    "--disable-background-networking", "--disable-client-side-phishing-detection",
+    "--disable-default-apps", "--disable-extensions", "--disable-hang-monitor",
+    "--disable-popup-blocking", "--disable-prompt-on-repost", "--disable-sync",
+    "--metrics-recording-only", "--safebrowsing-disable-auto-update",
+    "--password-store=basic", "--use-mock-keychain",
+    "--disable-features=Translate,BackForwardCache,AutomationControlled",
+  ];
+  const connectArgs = snap
+    ? [...launcherDefaults, ...commonArgs]
+    : [...commonArgs];
+
+  let browser, page;
+  const cleanup = () => {
+    try { browser?.close(); } catch {}
+    if (xvfb) { try { xvfb.kill("SIGTERM"); } catch {} }
+  };
+  process.on("SIGINT", () => { cleanup(); process.exit(0); });
+  process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
   try {
-    // ── STEP 1: Login ──
+    log("Launching browser (puppeteer-real-browser)...");
+    const result = await connect({
+      headless: false,
+      args: connectArgs,
+      customConfig: { chromePath: chrome },
+      turnstile: true,
+      connectOption: { defaultViewport: { width: 1280, height: 900 } },
+      disableXvfb: true,
+      ignoreAllFlags: snap,
+    });
+    browser = result.browser;
+    page = result.page;
+    page.setDefaultNavigationTimeout(90000);
+    page.on("dialog", async (d) => { log(`Dialog: ${d.message()}`); await d.dismiss(); });
+    log("Browser launched ✓");
+
+    // ── STEP 1: Login ──────────────────────────────────────────────────────
     log("\n── STEP 1: Login ──");
-    await earnPage.goto("https://vektalnodes.in/earn", { waitUntil: "domcontentloaded", timeout: 60000 });
-    await sleep(2000);
-    if ((await earnPage.content()).includes('type="password"')) {
-      await (await earnPage.$('input[type="email"]')).type(process.env.EMAIL, { delay: 60 });
-      await (await earnPage.$('input[type="password"]')).type(process.env.PASSWORD, { delay: 60 });
-      await (await earnPage.$('button[type="submit"]')).click();
-      await sleep(5000);
+    await page.goto(SITE, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await waitForCF(page, 60000);
+    await sleep(1000);
+
+    await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await waitForCF(page);
+    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 30000 }).catch(() => {});
+    await sleep(600);
+
+    let emailEl = await page.$('input[type="email"], input[name="email"]');
+    if (!emailEl) {
+      log("Email input not found — reloading...");
+      await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await waitForCF(page);
+      await sleep(800);
+      emailEl = await page.$('input[type="email"], input[name="email"]');
     }
-    log(`  ✓ Logged in: ${earnPage.url()}`);
-    await shot(earnPage, "earn-page");
+    if (!emailEl) throw new Error("No email input found on login page");
 
-    // ── STEP 2: Open LinkPays flow page ──
-    log("\n── STEP 2: Open LinkPays ──");
+    await emailEl.click({ clickCount: 3 });
+    await emailEl.type(EMAIL, { delay: 55 });
+    const passEl = await page.$('input[type="password"]');
+    if (!passEl) throw new Error("No password input found");
+    await passEl.click({ clickCount: 3 });
+    await passEl.type(PASSWORD, { delay: 55 });
 
-    // Click button — this fires POST /earn/linkpays/start AND opens new tab
-    await earnPage.click("button.button-primary");
-    log("  Clicked button.button-primary (POST /earn/linkpays/start fired)");
+    await Promise.allSettled([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
+      page.keyboard.press("Enter"),
+    ]);
+    await waitForCF(page);
 
-    // Wait 8s for the new tab + Cloudflare challenge to settle
-    await sleep(8000, "new tab + Cloudflare to load");
+    if (page.url().includes("/login")) {
+      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await waitForCF(page);
+      if (page.url().includes("/login")) throw new Error("Login failed — still on /login");
+    }
+    log(`✓ Logged in: ${page.url()}`);
+    await shot(page, "earn-page");
 
-    // Find the real linkpays.in page (not about:blank, not earn page)
-    let flowPage = null;
-    const allPages = await browser.pages();
-    log(`  Open pages: ${allPages.map((p) => p.url()).join(" | ")}`);
-    for (const p of allPages) {
-      const u = p.url();
-      if (u !== "about:blank" && !u.includes("vektalnodes.in") && u !== "") {
-        flowPage = p;
-        log(`  ✓ Found flow page: ${u}`);
-        break;
+    // Check coins before
+    const coinsBefore = await page.evaluate(() => {
+      const el = document.querySelector(".topbar-pill strong");
+      return el ? parseInt(el.innerText.trim(), 10) || 0 : 0;
+    }).catch(() => 0);
+    log(`Coins before: ${coinsBefore}`);
+
+    // ── STEP 2: Click "Open LinkPays" ──────────────────────────────────────
+    log("\n── STEP 2: Click Open LinkPays ──");
+    const lpBtn = await page.$('button.button-primary[type="submit"], button.button.button-primary');
+    if (!lpBtn) throw new Error("LinkPays button not found on /earn page");
+
+    log("  Clicking button — POST /earn/linkpays/start will fire + redirect to linkpays.in...");
+    await lpBtn.click();
+
+    // MAIN TAB navigates to linkpays.in via 302 redirect
+    log("  Waiting for MAIN TAB to navigate to linkpays.in...");
+    let linkpaysUrl;
+    try {
+      linkpaysUrl = await waitForUrl(page, ["linkpays.in"], 20000, "main-tab");
+    } catch {
+      log(`  Current URL: ${page.url()} — did not reach linkpays.in in 20s`);
+      throw new Error("Main tab did not navigate to linkpays.in after button click");
+    }
+    log(`  ✓ On linkpays.in: ${linkpaysUrl}`);
+    await waitForCF(page, 30000);
+    await sleep(1000);
+    await shot(page, "linkpays-page");
+
+    // ── STEP 3: Wait for proceed() then call it manually ──────────────────
+    log("\n── STEP 3: proceed() on linkpays.in ──");
+
+    // Decode the target URL from proceed()
+    const proceedTarget = await page.evaluate(() => {
+      const scripts = Array.from(document.querySelectorAll("script"));
+      for (const s of scripts) {
+        const m = (s.textContent || "").match(/atob\("([A-Za-z0-9+/=]+)"\)/);
+        if (m) { try { return atob(m[1]); } catch { return ""; } }
+      }
+      return "";
+    }).catch(() => "");
+    log(`  proceed() target: ${proceedTarget || "(not found yet)"}`);
+
+    // Wait 4s for auto-proceed, then call manually
+    await sleep(4000, "auto-proceed timer");
+    const proceedCalled = await page.evaluate(() => {
+      if (typeof proceed === "function") { proceed(); return true; }
+      return false;
+    }).catch(() => false);
+    log(`  proceed() manually called: ${proceedCalled}`);
+
+    // ── STEP 4: Wait for navigation to ad site ────────────────────────────
+    log("\n── STEP 4: Navigate to ad site ──");
+    let adSiteUrl;
+    try {
+      adSiteUrl = await waitForUrl(page, ["evspec.in", "rank1st.in", "savepe.in", "bookyourhotel.in", "earn/linkpays/complete"], 30000, "ad-site");
+    } catch {
+      const u = page.url();
+      log(`  WARNING: Still on ${u} — checking if still linkpays.in...`);
+      if (u.includes("linkpays.in")) {
+        // Try clicking "Continue to next step" button
+        await clickButton(page, ["button.btn", "a.btn", ".btn"], ["continue", "next step"], "Continue to next step");
+        await sleep(5000);
+        adSiteUrl = page.url();
+        log(`  After continue click: ${adSiteUrl}`);
+      } else {
+        adSiteUrl = u;
       }
     }
+    log(`  ✓ Ad site: ${adSiteUrl}`);
+    await shot(page, "ad-site-start");
 
-    if (!flowPage) {
-      // The linkpays.in page might still be loading — wait more
-      log("  No flow page yet — waiting 10 more seconds...");
-      await sleep(10000);
-      const pages2 = await browser.pages();
-      log(`  Pages now: ${pages2.map((p) => p.url()).join(" | ")}`);
-      flowPage = pages2.find((p) => {
-        const u = p.url();
-        return u !== "about:blank" && !u.includes("vektalnodes.in") && u !== "";
-      }) || null;
-    }
+    // ── STEP 5: Loop through ad pages ─────────────────────────────────────
+    log("\n── STEP 5: Ad page loop ──");
+    for (let i = 1; i <= 6; i++) {
+      const u = page.url();
+      log(`\n  [loop ${i}] URL: ${u}`);
 
-    if (flowPage) {
-      await flowPage.setViewport({ width: 1280, height: 800 });
-      flowPage.setDefaultNavigationTimeout(90000);
-      await flowPage.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36");
-      flowPage.on("dialog", async (d) => { log(`Dialog: ${d.message()}`); await d.dismiss(); });
-    } else {
-      log("  Still no flow page — creating new page and navigating directly");
-      flowPage = await browser.newPage();
-      await flowPage.setViewport({ width: 1280, height: 800 });
-      await flowPage.goto("https://linkpays.in/VEKTALNODES_COINS", { waitUntil: "domcontentloaded", timeout: 60000 });
-      await sleep(3000);
-    }
-
-    await sleep(2000);
-    log(`  Flow page URL: ${flowPage.url()}`);
-    await shot(flowPage, "linkpays-page");
-
-    // ── STEP 3: linkpays.in — Click "Continue to Next" ──
-    log("\n── STEP 3: linkpays.in — Continue to Next ──");
-    const continueBtnVisible = await waitForVisible(flowPage, "button.btn, a.btn", 10000);
-    log(`  Continue button visible: ${continueBtnVisible}`);
-
-    await clickSelector(flowPage, "button.btn", "Continue to Next");
-    await sleep(5000);
-    log(`  After continue: ${flowPage.url()}`);
-    await shot(flowPage, "after-linkpays-continue");
-
-    // ── STEPS 4+: Loop through all ad pages ──
-    log("\n── STEPS 4+: Ad page loop ──");
-    for (let pageNum = 1; pageNum <= 6; pageNum++) {
-      const url = flowPage.url();
-      log(`\n  Page ${pageNum} URL: ${url}`);
-
-      if (url.includes("vektalnodes.in")) {
-        log("  → Back on vektalnodes.in — flow complete!");
+      if (u.includes("vektalnodes.in")) {
+        log("  ✓ Back on vektalnodes.in!");
         break;
       }
-      if (url.includes("bookyourhotel.in") || url.includes("linkpays.in")) {
-        log("  → On final gateway page, breaking ad loop.");
+      if (u.includes("bookyourhotel.in")) {
+        log("  → On bookyourhotel.in — jumping to gateway step");
         break;
       }
-
-      // Google vignette: URL has #google_vignette — just wait for auto-redirect
-      if (url.includes("#google_vignette") || url.includes("google_vignette")) {
-        log("  Google vignette detected — waiting for auto-redirect...");
+      // Google vignette auto-redirects
+      if (u.includes("google_vignette") || u.includes("google.com/url")) {
+        log("  Google vignette — waiting 8s for auto-redirect...");
         await sleep(8000);
-        log(`  After vignette: ${flowPage.url()}`);
         continue;
       }
-
-      let isAd = false;
-      try { isAd = await isAdPage(flowPage); } catch {}
-      log(`  Has tp- buttons: ${isAd}`);
+      // Ad pages: rank1st.in, evspec.in, savepe.in, etc.
+      const isAd = await page.evaluate(() => !!(
+        document.querySelector("button.tp-unlock-btn") ||
+        document.querySelector("button.tp-btn") ||
+        document.querySelector(".tp-unlock-btn") ||
+        document.querySelector("[class*='tp-']")
+      )).catch(() => false);
 
       if (isAd) {
-        await handleAdPage(flowPage, `p${pageNum}`);
+        await handleAdPage(page, `p${i}`);
       } else {
-        log("  Not an ad page — waiting 5s for auto-redirect...");
-        await sleep(5000);
-        log(`  After wait: ${flowPage.url()}`);
+        log("  Not an ad page — waiting 6s for auto-redirect...");
+        await sleep(6000);
       }
     }
 
-    // ── STEP: bookyourhotel.in or linkpays gateway ──
-    log("\n── Gateway page (hotel/linkpays) ──");
-
-    // Wait up to 30s for the correct bookyourhotel URL with ?link= param
-    log("  Waiting for bookyourhotel.in/?link= URL...");
-    for (let i = 0; i < 30; i++) {
-      const u = flowPage.url();
-      if (u.includes("bookyourhotel.in") && u.includes("link=")) {
-        log(`  ✓ Got correct URL: ${u}`);
-        break;
-      }
-      if (u.includes("linkpays.in")) {
-        log(`  ✓ Already on linkpays: ${u}`);
-        break;
-      }
-      if (u.includes("vektalnodes.in")) {
-        log(`  ✓ Back on vektalnodes — flow may be complete: ${u}`);
-        break;
-      }
+    // ── STEP 6: bookyourhotel.in — Get Link ──────────────────────────────
+    log("\n── STEP 6: bookyourhotel.in (final gateway) ──");
+    let onHotel = false;
+    for (let i = 0; i < 20; i++) {
+      const u = page.url();
+      if (u.includes("bookyourhotel.in")) { onHotel = true; break; }
+      if (u.includes("vektalnodes.in")) { log(`  Already back on vektalnodes: ${u}`); break; }
       await sleep(1000);
     }
 
-    const gatewayUrl = flowPage.url();
-    log(`  URL: ${gatewayUrl}`);
-    await shot(flowPage, "gateway-start");
+    if (onHotel) {
+      log(`  On bookyourhotel.in: ${page.url()}`);
+      await shot(page, "hotel-start");
+      // Wait 30s countdown minimum
+      await waitForCountdown(page, 40000, "hotel", 30000);
+      await shot(page, "hotel-after-wait");
 
-    // Must wait until 240s+ elapsed
+      // Click Get Link
+      const gotLink = await clickButton(
+        page,
+        ["button.tp-btn", "#get-link", ".get-link", "a.btn"],
+        ["get link", "get links", "claim", "proceed", "continue"],
+        "Get Link",
+      );
+      await sleep(5000);
+      log(`  After Get Link: ${page.url()}`);
+      await shot(page, "hotel-after-get-link");
+    }
+
+    // ── STEP 7: Final — check coins ───────────────────────────────────────
+    log("\n── STEP 7: Final check ──");
+    const finalUrl = page.url();
+    log(`  Final URL: ${finalUrl}`);
+    await shot(page, "final-url");
+
+    // Navigate to /earn to verify coins
+    await sleep(3000);
+    if (!page.url().includes("vektalnodes.in/earn")) {
+      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await waitForCF(page);
+    }
+    await sleep(2000);
+
+    const coinsAfter = await page.evaluate(() => {
+      const el = document.querySelector(".topbar-pill strong");
+      return el ? parseInt(el.innerText.trim(), 10) || 0 : 0;
+    }).catch(() => 0);
+
+    const flash = await page.evaluate(() => {
+      const el = document.querySelector(".alert, .flash, [role='alert'], .notice");
+      return el ? (el.textContent || el.innerText || "").trim() : "";
+    }).catch(() => "");
+
+    await shot(page, "earn-final");
+
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
-    const minRequired = 245;
-    if (elapsed < minRequired) {
-      const waitMs = (minRequired - elapsed) * 1000;
-      log(`  Elapsed: ${elapsed}s — waiting ${minRequired - elapsed}s more for 240s minimum...`);
-      await sleep(waitMs, "240s minimum");
+    log(`\n${"═".repeat(50)}`);
+    log(`Coins BEFORE : ${coinsBefore}`);
+    log(`Coins AFTER  : ${coinsAfter}`);
+    log(`Diff         : +${coinsAfter - coinsBefore}`);
+    log(`Flash msg    : ${flash || "(none)"}`);
+    log(`Total time   : ${elapsed}s`);
+    if (coinsAfter > coinsBefore) {
+      log(`✅ SUCCESS — earned ${coinsAfter - coinsBefore} coins!`);
     } else {
-      log(`  Elapsed: ${elapsed}s — past minimum. Waiting 30s for page timer...`);
-      await sleep(30000, "page timer");
+      log(`⚠️  No coins credited yet (check flash message / cooldown)`);
     }
-
-    await shot(flowPage, "gateway-after-wait");
-
-    // Click Get Link button (exact class match)
-    const gotLink = await clickSelector(flowPage, "button.tp-btn, .get-link-btn, #get-link, button[class*='get']", "Get Link (css)");
-    if (!gotLink) {
-      // Text search with exact match only
-      const found = await flowPage.evaluate(() => {
-        const all = document.querySelectorAll("a, button");
-        for (const el of all) {
-          const txt = (el.innerText || "").trim().toLowerCase();
-          if (txt === "get link" || txt === "get links" || txt === "claim" || txt === "proceed") {
-            el.click();
-            return el.innerText;
-          }
-        }
-        return null;
-      });
-      log(found ? `  ✓ Clicked: ${found}` : "  ✗ Get Link not found");
-    }
-
-    await sleep(5000);
-    log(`  After Get Link: ${flowPage.url()}`);
-    await shot(flowPage, "after-get-link");
-
-    await sleep(5000);
-    log(`\n  Final URL: ${flowPage.url()}`);
-    await shot(flowPage, "final");
-
-    const total = Math.floor((Date.now() - startTime) / 1000);
-    log(`\n=== Test complete in ${total}s ===`);
+    log(`${"═".repeat(50)}`);
     log(`📁 Screenshots: ${SCREENSHOTS_DIR}`);
 
   } catch (err) {
     log(`\nFATAL: ${err.message}`);
     console.error(err.stack);
     try {
-      const pages = await browser.pages();
-      for (const p of pages) {
-        await p.screenshot({ path: path.join(SCREENSHOTS_DIR, `fatal-${p.url().replace(/\//g, "_").substring(0, 30)}.png`), fullPage: true }).catch(() => {});
-      }
+      if (page) await shot(page, "fatal-error").catch(() => {});
     } catch {}
+  } finally {
+    cleanup();
   }
-
-  await browser.close();
 })();

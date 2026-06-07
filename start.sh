@@ -9,14 +9,14 @@ echo "=========================================="
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BOT_DIR="$SCRIPT_DIR/afk-bot"
 
-echo "[1/4] Checking Node.js..."
+echo "[1/5] Checking Node.js..."
 if ! command -v node &>/dev/null; then
   echo "[ERROR] Node.js not installed. Install from https://nodejs.org"
   exit 1
 fi
 node --version
 
-echo "[2/4] Locating .env file..."
+echo "[2/5] Locating .env file..."
 
 if [ -f "$BOT_DIR/.env" ]; then
   echo "Found .env in afk-bot/"
@@ -36,14 +36,13 @@ else
   exit 1
 fi
 
-echo "[3/4] Installing Node dependencies..."
+echo "[3/5] Installing Node dependencies..."
 cd "$BOT_DIR"
 rm -rf node_modules package-lock.json
 PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund
 echo "Dependencies installed."
 
-echo "[4/4] Detecting Chrome/Chromium..."
-CHROMIUM_PATH=""
+echo "[4/5] Detecting Chrome/Chromium + Xvfb..."
 
 find_chrome() {
   for candidate in \
@@ -51,19 +50,17 @@ find_chrome() {
     "/usr/bin/google-chrome" \
     "/usr/local/bin/google-chrome" \
     "/usr/bin/chromium" \
-    "/snap/bin/chromium"; do
+    "/usr/bin/chromium-browser"; do
     if [ -x "$candidate" ]; then
-      # Skip snap stubs (they fail without snapd)
       if file "$candidate" 2>/dev/null | grep -q "ELF"; then
         echo "$candidate"
         return
-      elif [ "$candidate" != "/usr/bin/chromium-browser" ] && [ "$candidate" != "/snap/bin/chromium" ]; then
+      elif [ "$candidate" != "/usr/bin/chromium-browser" ]; then
         echo "$candidate"
         return
       fi
     fi
   done
-  # Try which, skip snap paths
   for cmd in google-chrome-stable google-chrome chromium; do
     path="$(which "$cmd" 2>/dev/null || true)"
     if [ -n "$path" ] && [ -x "$path" ]; then
@@ -99,7 +96,34 @@ if [ -z "$CHROMIUM_PATH" ]; then
 fi
 
 echo "Using Chrome: $CHROMIUM_PATH"
+
+# Install Xvfb (needed for puppeteer-real-browser headless: false)
+if ! command -v Xvfb &>/dev/null; then
+  echo "Xvfb not found. Installing..."
+  apt-get update -qq
+  apt-get install -y -qq xvfb
+fi
+echo "Xvfb: $(which Xvfb)"
+
+echo "[5/5] Starting AFK bot with Xvfb virtual display..."
+echo "(Press Ctrl+C to stop)"
 echo ""
-echo "Starting AFK bot... (Press Ctrl+C to stop)"
+
+# Kill any leftover Xvfb on our display
+Xvfb :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
+XVFB_PID=$!
+sleep 2
+export DISPLAY=:94
+
+echo "Display: $DISPLAY | Chrome: $CHROMIUM_PATH"
 echo ""
-CHROMIUM_PATH="$CHROMIUM_PATH" node bot.js
+
+# Trap Ctrl+C to cleanly kill Xvfb
+cleanup() {
+  echo ""
+  echo "Stopping..."
+  kill "$XVFB_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+CHROMIUM_PATH="$CHROMIUM_PATH" DISPLAY="$DISPLAY" node bot.js
