@@ -95,10 +95,48 @@ async function waitForCF(page, ms = 90000) {
   while (Date.now() < dl) {
     const title = await page.title().catch(() => "");
     const url   = page.url();
-    if (!title.toLowerCase().includes("just a moment") && !url.includes("cdn-cgi/challenge")) return;
-    log("  [CF] Cloudflare challenge active — waiting...");
-    await sleep(2000);
+
+    // Cloudflare "Just a moment"
+    if (title.toLowerCase().includes("just a moment") || url.includes("cdn-cgi/challenge")) {
+      log("  [CF] Cloudflare challenge active — waiting...");
+      await sleep(2000);
+      continue;
+    }
+
+    // SECUREGATEWAY — "Checking Browser / Analyzing Network"
+    const sgState = await page.evaluate(() => {
+      const body = (document.body && document.body.innerText) || "";
+      const hasGateway = document.querySelector(".securegateway, [class*='securegateway']") ||
+        body.includes("SECUREGATEWAY") || body.includes("Checking Browser") || body.includes("Analyzing Network");
+      if (!hasGateway) return null;
+      const verified = body.includes("Verification Complete") || body.includes("VERIFIED");
+      const btn = Array.from(document.querySelectorAll("button, a")).find(el =>
+        (el.innerText || "").toLowerCase().includes("continue")
+      );
+      return { verified, hasBtn: !!btn };
+    }).catch(() => null);
+
+    if (sgState) {
+      if (sgState.verified && sgState.hasBtn) {
+        log("  [SG] SECUREGATEWAY verified — clicking Continue to Next...");
+        await page.evaluate(() => {
+          const btn = Array.from(document.querySelectorAll("button, a")).find(el =>
+            (el.innerText || "").toLowerCase().includes("continue")
+          );
+          if (btn) btn.click();
+        }).catch(() => {});
+        await sleep(3000);
+        continue;
+      }
+      log("  [SG] SECUREGATEWAY analyzing — waiting...");
+      await sleep(2000);
+      continue;
+    }
+
+    // No challenge — clear
+    return;
   }
+  log("  [CF/SG] Warning: challenge may not have cleared.");
 }
 
 async function waitForUrl(page, matches, timeoutMs = 60000, label = "") {
