@@ -24,7 +24,7 @@ const EMAIL        = process.env.EMAIL    || process.env.VEKTAL_EMAIL    || "";
 const PASSWORD     = process.env.PASSWORD || process.env.VEKTAL_PASSWORD || "";
 const DISPLAY_NUM  = ":94";
 const XVFB_PATH    = "/usr/bin/Xvfb";
-const COOLDOWN_MS  = 315_000;   // 315s > 300s server cooldown
+const COOLDOWN_MS  = 250_000;   // 250s default cooldown
 const MAX_DAILY    = 10;
 const MIN_FLOW_S   = 245;        // server requires 240s minimum
 
@@ -214,23 +214,44 @@ async function getLinkPaysStatus(page) {
     for (const c of cards) {
       if ((c.textContent || "").toLowerCase().includes("linkpays")) { lpCard = c; break; }
     }
-    if (!lpCard) return { available: false, cooldownSec: 0, usageToday: 0, flash: "" };
+    if (!lpCard) return { available: false, cooldownSec: 0, usageToday: 0, maxUsage: 10, flash: "" };
 
     const btn = lpCard.querySelector('button.button-primary[type="submit"]');
     const available = !!btn && !btn.disabled;
-    const expEl = lpCard.querySelector("[data-expire-seconds]");
-    const cooldownSec = expEl ? parseInt(expEl.getAttribute("data-expire-seconds") || "0", 10) : 0;
 
-    const usageEl = lpCard.querySelector(".status-pill, [class*='usage']");
-    const usageText = usageEl ? usageEl.innerText : "";
-    const usageMatch = usageText.match(/(\d+)\s*\/\s*(\d+)/);
-    const usageToday = usageMatch ? parseInt(usageMatch[1], 10) : 0;
+    // Read all .status-pill spans inside the card
+    const pills = Array.from(lpCard.querySelectorAll(".status-pill"));
+    let usageToday = 0, maxUsage = 10, cooldownSec = 0;
+
+    for (const pill of pills) {
+      const text = (pill.innerText || "").trim();
+
+      // "24h usage: 9 / 10"
+      if (/usage/i.test(text)) {
+        const m = text.match(/(\d+)\s*\/\s*(\d+)/);
+        if (m) { usageToday = parseInt(m[1], 10); maxUsage = parseInt(m[2], 10); }
+      }
+
+      // "Next slot opens in 4h 42m" / "Next slot opens in 30m" / "Next slot opens in 2h"
+      const slotMatch = text.match(/next slot opens in\s*(?:(\d+)h)?\s*(?:(\d+)m)?/i);
+      if (slotMatch) {
+        const h = parseInt(slotMatch[1] || "0", 10);
+        const m2 = parseInt(slotMatch[2] || "0", 10);
+        cooldownSec = h * 3600 + m2 * 60;
+      }
+    }
+
+    // Fallback: data-expire-seconds attribute
+    if (cooldownSec === 0) {
+      const expEl = lpCard.querySelector("[data-expire-seconds]");
+      if (expEl) cooldownSec = parseInt(expEl.getAttribute("data-expire-seconds") || "0", 10);
+    }
 
     const flashEl = document.querySelector(".alert, .flash, [role='alert'], .notice");
     const flash = flashEl ? (flashEl.textContent || "").trim() : "";
 
-    return { available, cooldownSec, usageToday, flash };
-  }).catch(() => ({ available: false, cooldownSec: 0, usageToday: 0, flash: "" }));
+    return { available, cooldownSec, usageToday, maxUsage, flash };
+  }).catch(() => ({ available: false, cooldownSec: 0, usageToday: 0, maxUsage: 10, flash: "" }));
 }
 
 // ── Handle one evspec/rank1st ad page ─────────────────────────────────────────
@@ -275,7 +296,7 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   const coinsBefore = await getCoins(page);
   const status = await getLinkPaysStatus(page);
-  log(`Coins: ${coinsBefore} | LP: available=${status.available} usage=${status.usageToday}/10 cooldown=${status.cooldownSec}s`);
+  log(`Coins: ${coinsBefore} | LP: available=${status.available} usage=${status.usageToday}/${status.maxUsage} cooldown=${status.cooldownSec}s`);
 
   if (!status.available) {
     if (status.cooldownSec > 0) {
@@ -544,23 +565,37 @@ async function keepAliveOnce(page) {
         } catch {}
       }
 
-      // ── AFK keep-alive tick (every 30s) ──────────────────────────────
+      // ── AFK keep-alive tick (every 60s) ──────────────────────────────
       afkTick++;
       await keepAliveOnce(page).catch(() => {});
 
-      const secUntilNext = Math.max(0, Math.round((nextCycleAt - Date.now()) / 1000));
-      const coins = await getCoins(page).catch(() => "?");
-      log(`[AFK tick ${afkTick}] Coins: ${coins} | Cycles: ${successCount}/${MAX_DAILY} | Next LP cycle: ${secUntilNext > 0 ? secUntilNext + "s" : "NOW"}`);
-
-      // Reload earn page every 5 ticks to keep session alive
-      if (afkTick % 5 === 0 && page.url().includes("vektalnodes.in")) {
-        try {
+      // Reload /earn every tick to get fresh status
+      try {
+        if (!page.url().includes(`${SITE}/earn`)) {
+          await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+        } else {
           await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
-          await waitForCF(page, 10000);
-        } catch {}
-      }
+        }
+        await waitForCF(page, 10000);
+      } catch {}
 
-      await sleep(30000);
+      // Read real usage + next slot from page
+      const liveStatus = await getLinkPaysStatus(page).catch(() => null);
+      const coins = await getCoins(page).catch(() => "?");
+      const secUntilNext = Math.max(0, Math.round((nextCycleAt - Date.now()) / 1000));
+      const usageStr = liveStatus ? `${liveStatus.usageToday}/${liveStatus.maxUsage}` : `${successCount}/${MAX_DAILY}`;
+      log(`[AFK tick ${afkTick}] Coins: ${coins} | Usage: ${usageStr} | Next LP cycle: ${secUntilNext > 0 ? secUntilNext + "s" : "NOW"}`);
+
+      // If page shows a "Next slot opens in Xh Ym" cooldown, sleep the bot for exactly that long
+      if (liveStatus && liveStatus.cooldownSec > 0 && successCount < MAX_DAILY) {
+        const slotMs = liveStatus.cooldownSec * 1000;
+        const wakeAt = new Date(Date.now() + slotMs).toLocaleTimeString();
+        log(`💤 Next slot opens in ${Math.floor(liveStatus.cooldownSec / 3600)}h ${Math.floor((liveStatus.cooldownSec % 3600) / 60)}m — sleeping until ${wakeAt}`);
+        nextCycleAt = Date.now() + slotMs;
+        await sleep(slotMs, "slot wait");
+      } else {
+        await sleep(60000);
+      }
     }
 
   } catch (err) {
