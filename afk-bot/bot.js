@@ -6,6 +6,12 @@
  *   /earn → Open LinkPays → linkpays.in → SECUREGATEWAY
  *   → proceed() → evspec.in / rank1st.in (4 ad pages)
  *   → bookyourhotel.in → 240s min → GET LINK → +12 coins ✅
+ *
+ * SLOT TRACKING (rolling 24-hour window):
+ *   Each of the 10 daily slots reopens exactly 24h after it was used.
+ *   e.g. used at 12:41 → available again next day at 12:41
+ *        used at 06:00 → available again next day at 06:00
+ *   Slot usage is persisted to slot-log.json so restarts don't lose history.
  */
 
 require("dotenv").config();
@@ -22,9 +28,83 @@ const DISPLAY_NUM = ":94";
 const XVFB_PATH   = "/usr/bin/Xvfb";
 const MAX_DAILY   = 10;
 const MIN_FLOW_S  = 245;
+const SLOT_WINDOW_MS = 24 * 60 * 60 * 1000;  // 24 hours in ms
 
 const SCREENSHOTS_DIR = path.join(__dirname, "screenshots");
 if (!fs.existsSync(SCREENSHOTS_DIR)) fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+
+// ── Rolling slot tracker ──────────────────────────────────────────────────────
+// Persists up to MAX_DAILY timestamps (one per slot use) in slot-log.json.
+// Each slot reopens exactly SLOT_WINDOW_MS (24h) after it was used.
+
+const SLOT_LOG_PATH = path.join(__dirname, "slot-log.json");
+
+function loadSlotLog() {
+  try {
+    if (fs.existsSync(SLOT_LOG_PATH)) {
+      const data = JSON.parse(fs.readFileSync(SLOT_LOG_PATH, "utf8"));
+      if (Array.isArray(data.slots)) return data.slots.map(Number);
+    }
+  } catch {}
+  return [];
+}
+
+function saveSlotLog(slots) {
+  try { fs.writeFileSync(SLOT_LOG_PATH, JSON.stringify({ slots }, null, 2)); } catch {}
+}
+
+/**
+ * Returns only the slot timestamps that are still within the 24h window.
+ * Slots older than 24h have already "expired" and are free again.
+ */
+function activeSlots(slots) {
+  const cutoff = Date.now() - SLOT_WINDOW_MS;
+  return slots.filter((t) => t > cutoff);
+}
+
+/**
+ * How many slots are free right now?
+ */
+function freeSlotsNow(slots) {
+  return MAX_DAILY - activeSlots(slots).length;
+}
+
+/**
+ * Record a successful slot use (current time).
+ * Trims old entries that are already outside the 24h window.
+ */
+function recordSlotUse(slots) {
+  const updated = [...activeSlots(slots), Date.now()];
+  saveSlotLog(updated);
+  return updated;
+}
+
+/**
+ * Returns the ms until the next slot opens (0 if a slot is free now).
+ * The oldest active slot will expire first — that's when the next slot opens.
+ */
+function msUntilNextSlot(slots) {
+  const active = activeSlots(slots);
+  if (active.length < MAX_DAILY) return 0;
+  const oldest = Math.min(...active);
+  const opensAt = oldest + SLOT_WINDOW_MS;
+  return Math.max(0, opensAt - Date.now());
+}
+
+/**
+ * Log a human-readable slot status table.
+ */
+function logSlotStatus(slots) {
+  const active = activeSlots(slots);
+  log(`[Slots] ${active.length}/${MAX_DAILY} used in last 24h | ${MAX_DAILY - active.length} free now`);
+  if (active.length > 0) {
+    const sorted = [...active].sort((a, b) => a - b);
+    sorted.forEach((t, i) => {
+      const opensAt = new Date(t + SLOT_WINDOW_MS);
+      log(`  Slot ${i + 1}: used at ${new Date(t).toLocaleTimeString()} → reopens at ${opensAt.toLocaleTimeString()}`);
+    });
+  }
+}
 
 if (!EMAIL || !PASSWORD) {
   console.error("[ERROR] EMAIL and PASSWORD must be set in .env or environment");
@@ -801,10 +881,22 @@ async function runLinkPaysCycle(page, cycleNum) {
     await doLogin(page);
 
     // ── Main loop ─────────────────────────────────────────────────────
-    let successCount = 0;
-    let cycleNum     = 0;
-    let afkTick      = 0;
-    let nextCycleAt  = Date.now();  // run first cycle immediately
+    let cycleNum = 0;
+    let afkTick  = 0;
+
+    // Load persisted slot timestamps — each entry = when that slot was last used
+    let slotLog = loadSlotLog();
+    log(`\n[Slots] Loaded ${slotLog.length} slot(s) from log. Active in last 24h: ${activeSlots(slotLog).length}`);
+    logSlotStatus(slotLog);
+
+    // Determine first wake time from local slot log
+    let nextCycleAt = Date.now() + msUntilNextSlot(slotLog);
+    if (nextCycleAt > Date.now()) {
+      const wakeAt = new Date(nextCycleAt).toLocaleTimeString();
+      log(`[Slots] Next free slot opens at ${wakeAt} — sleeping until then.`);
+    } else {
+      log("[Slots] A slot is free now — starting cycle immediately.");
+    }
 
     log(`\nBot running. Will earn up to ${MAX_DAILY} × 12 = ${MAX_DAILY * 12} coins/day.`);
     log("Press Ctrl+C to stop.\n");
@@ -814,34 +906,55 @@ async function runLinkPaysCycle(page, cycleNum) {
 
       // ── LinkPays cycle ───────────────────────────────────────────
       if (now >= nextCycleAt) {
-        cycleNum++;
-        try {
-          const res = await runLinkPaysCycle(page, cycleNum);
-          if (res.success) {
-            successCount++;
-            log(`Daily progress: ${successCount}/${MAX_DAILY} cycles complete (${successCount * 12} coins today)`);
-            if (successCount >= MAX_DAILY) {
-              log(`🎉 All ${MAX_DAILY} cycles done today!`);
+        // Double-check local slot log — confirm a slot is actually free
+        const waitMs = msUntilNextSlot(slotLog);
+        if (waitMs > 0) {
+          const wakeAt = new Date(Date.now() + waitMs).toLocaleTimeString();
+          log(`[Slots] All ${MAX_DAILY} slots still active — next opens at ${wakeAt}`);
+          nextCycleAt = Date.now() + waitMs;
+        } else {
+          cycleNum++;
+          try {
+            const res = await runLinkPaysCycle(page, cycleNum);
+            if (res.success) {
+              // Record the slot use — this slot reopens exactly 24h from now
+              slotLog = recordSlotUse(slotLog);
+              const active = activeSlots(slotLog);
+              log(`[Slots] Slot recorded. ${active.length}/${MAX_DAILY} used in last 24h.`);
+              logSlotStatus(slotLog);
+
+              // Schedule next cycle: either immediately (slot free) or when oldest slot expires
+              const nextWait = msUntilNextSlot(slotLog);
+              if (nextWait === 0) {
+                nextCycleAt = Date.now() + 30_000;  // small buffer then run again
+                log(`[Slots] Another slot is free — next cycle in 30s.`);
+              } else {
+                nextCycleAt = Date.now() + nextWait;
+                const wakeAt = new Date(nextCycleAt).toLocaleTimeString();
+                log(`⏳ Next slot opens at ${wakeAt} — sleeping until then.`);
+              }
+            } else if (res.waitMs > 0) {
+              // Page says wait — but also check our local slot log
+              const localWait = msUntilNextSlot(slotLog);
+              const effectiveWait = localWait > 0 ? Math.max(res.waitMs, localWait) : res.waitMs;
+              nextCycleAt = Date.now() + effectiveWait;
+              log(`Waiting ${Math.round(effectiveWait / 1000)}s before next attempt (page: ${Math.round(res.waitMs/1000)}s, local slot: ${Math.round(localWait/1000)}s)...`);
+            } else {
+              nextCycleAt = Date.now() + 60_000;
             }
-            nextCycleAt = Date.now() + 60_000;  // re-check in 60s (page will show next slot timer)
-          } else if (res.waitMs > 0) {
-            nextCycleAt = Date.now() + res.waitMs;
-            log(`Waiting ${Math.round(res.waitMs / 1000)}s before next attempt...`);
-          } else {
+          } catch (err) {
+            log(`Cycle ${cycleNum} ERROR: ${err.message}`);
             nextCycleAt = Date.now() + 60_000;
           }
-        } catch (err) {
-          log(`Cycle ${cycleNum} ERROR: ${err.message}`);
-          nextCycleAt = Date.now() + 60_000;
-        }
 
-        // Return to /earn after cycle
-        try {
-          if (!page.url().includes("vektalnodes.in/earn")) {
-            await safeGoto(page, `${SITE}/earn`, 30000);
-            await waitForCF(page, 15000);
-          }
-        } catch {}
+          // Return to /earn after cycle
+          try {
+            if (!page.url().includes("vektalnodes.in/earn")) {
+              await safeGoto(page, `${SITE}/earn`, 30000);
+              await waitForCF(page, 15000);
+            }
+          } catch {}
+        }
       }
 
       // ── AFK keep-alive tick ──────────────────────────────────────
@@ -863,30 +976,40 @@ async function runLinkPaysCycle(page, cycleNum) {
         await ensureLoggedIn(page).catch((e) => log(`[AutoLogin] Re-login failed: ${e.message}`));
       } catch {}
 
-      const liveStatus  = await getLinkPaysStatus(page).catch(() => null);
-      const coins       = await getCoins(page).catch(() => "?");
-      const secToNext   = Math.max(0, Math.round((nextCycleAt - Date.now()) / 1000));
-      const usageStr    = liveStatus ? `${liveStatus.usageToday}/${liveStatus.maxUsage}` : `${successCount}/${MAX_DAILY}`;
+      const liveStatus = await getLinkPaysStatus(page).catch(() => null);
+      const coins      = await getCoins(page).catch(() => "?");
+      const secToNext  = Math.max(0, Math.round((nextCycleAt - Date.now()) / 1000));
+      const activeNow  = activeSlots(slotLog).length;
+      const usageStr   = liveStatus
+        ? `${liveStatus.usageToday}/${liveStatus.maxUsage}`
+        : `${activeNow}/${MAX_DAILY}`;
       log(`[AFK tick ${afkTick}] Coins: ${coins} | Usage: ${usageStr} | Next LP cycle: ${secToNext > 0 ? secToNext + "s" : "NOW"}`);
 
-      // Sleep based on real page status
-      const realFull   = liveStatus && liveStatus.usageToday >= liveStatus.maxUsage;
-      const hasCooldown = liveStatus && liveStatus.cooldownSec > 0;
-
-      if (hasCooldown) {
-        const slotMs = liveStatus.cooldownSec * 1000;
-        const wakeAt = new Date(Date.now() + slotMs).toLocaleTimeString();
-        const label  = realFull
+      // If page shows a slot-open time, cross-check with our local tracker
+      // and use whichever is later (safer — avoids wasting a cycle that will be rejected)
+      if (liveStatus && liveStatus.cooldownSec > 0) {
+        const pageWaitMs  = liveStatus.cooldownSec * 1000;
+        const localWaitMs = msUntilNextSlot(slotLog);
+        const bestWaitMs  = Math.max(pageWaitMs, localWaitMs);
+        const wakeAt      = new Date(Date.now() + bestWaitMs).toLocaleTimeString();
+        const isFull      = liveStatus.usageToday >= liveStatus.maxUsage;
+        const label       = isFull
           ? `💤 Daily limit (${liveStatus.usageToday}/${liveStatus.maxUsage}) — next slot at ${wakeAt}`
-          : `⏳ Next slot in ${Math.floor(liveStatus.cooldownSec / 3600)}h ${Math.floor((liveStatus.cooldownSec % 3600) / 60)}m — sleeping until ${wakeAt}`;
+          : `⏳ Next slot in ${Math.floor(bestWaitMs / 60000)}m — sleeping until ${wakeAt}`;
         log(label);
-        nextCycleAt = Date.now() + slotMs;
-        // Tick every 60s so the bot stays alive and logs progress during the wait
+        nextCycleAt = Date.now() + bestWaitMs;
         await sleep(60_000);
-      } else if (realFull) {
-        log(`💤 Daily limit (${liveStatus.usageToday}/${liveStatus.maxUsage}) — no timer visible, re-checking in 1h`);
-        nextCycleAt = Date.now() + 3_600_000;
-        // Tick every 60s so the bot stays alive and logs progress during the wait
+      } else if (liveStatus && liveStatus.usageToday >= liveStatus.maxUsage) {
+        // Page says full but no timer — trust local slot log
+        const localWaitMs = msUntilNextSlot(slotLog);
+        if (localWaitMs > 0) {
+          const wakeAt = new Date(Date.now() + localWaitMs).toLocaleTimeString();
+          log(`💤 Daily limit — local slot opens at ${wakeAt}`);
+          nextCycleAt = Date.now() + localWaitMs;
+        } else {
+          log(`💤 Daily limit — no timer visible, re-checking in 1h`);
+          nextCycleAt = Date.now() + 3_600_000;
+        }
         await sleep(60_000);
       } else {
         await sleep(60_000);
