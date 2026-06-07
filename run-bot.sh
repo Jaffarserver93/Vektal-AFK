@@ -45,6 +45,10 @@ fi
 
 echo "[3/5] Installing Node dependencies..."
 cd "$BOT_DIR"
+# Force public npm registry — Replit sets npm_config_registry as an env var
+# which overrides even the --registry flag, so we must unset it first
+unset npm_config_registry
+npm config set registry https://registry.npmjs.org 2>/dev/null || true
 PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund --registry https://registry.npmjs.org
 echo "  Dependencies installed."
 
