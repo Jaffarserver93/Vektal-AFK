@@ -46,7 +46,7 @@ fi
 
 echo "[3/5] Installing Node dependencies..."
 cd "$BOT_DIR"
-PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund
+PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund --registry https://registry.npmjs.org
 echo "  Dependencies installed."
 
 echo "[4/5] Detecting Chrome/Chromium..."
