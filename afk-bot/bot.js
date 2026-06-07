@@ -3,7 +3,7 @@ const puppeteer = require("puppeteer");
 
 const BASE_URL = "https://vektalnodes.in";
 const LOGIN_URL = `${BASE_URL}/earn`;
-const AFK_URL = `${BASE_URL}/afk`;
+const EARN_URL = `${BASE_URL}/earn`;
 
 const EMAIL = process.env.EMAIL;
 const PASSWORD = process.env.PASSWORD;
@@ -30,7 +30,6 @@ async function tryLogin(page) {
     'input[name="email"]',
     'input[name="username"]',
     'input[placeholder*="email" i]',
-    'input[placeholder*="Email" i]',
     'input[id*="email" i]',
     'input[id*="user" i]',
   ];
@@ -42,25 +41,11 @@ async function tryLogin(page) {
     'input[id*="password" i]',
   ];
 
-  const submitSelectors = [
-    'button[type="submit"]',
-    'input[type="submit"]',
-    'button:contains("Login")',
-    'button:contains("Sign in")',
-    'button:contains("Log in")',
-    '[class*="login" i] button',
-    '[class*="submit" i]',
-    "form button",
-  ];
-
   let emailField = null;
   for (const sel of emailSelectors) {
     try {
       emailField = await page.$(sel);
-      if (emailField) {
-        log(`Found email field: ${sel}`);
-        break;
-      }
+      if (emailField) { log(`Found email field: ${sel}`); break; }
     } catch {}
   }
 
@@ -68,62 +53,71 @@ async function tryLogin(page) {
   for (const sel of passwordSelectors) {
     try {
       passwordField = await page.$(sel);
-      if (passwordField) {
-        log(`Found password field: ${sel}`);
-        break;
-      }
+      if (passwordField) { log(`Found password field: ${sel}`); break; }
     } catch {}
   }
 
-  if (!emailField) {
-    log("Could not find email/username field on page.");
-    log("Current page HTML snippet:");
-    const html = await page.evaluate(() => document.body.innerHTML.substring(0, 2000));
-    console.log(html);
-    return false;
-  }
-
-  if (!passwordField) {
-    log("Could not find password field on page.");
+  if (!emailField || !passwordField) {
+    log("Could not find login fields.");
     return false;
   }
 
   await emailField.click({ clickCount: 3 });
   await emailField.type(EMAIL, { delay: 80 });
-  await sleep(500);
+  await sleep(400);
 
   await passwordField.click({ clickCount: 3 });
   await passwordField.type(PASSWORD, { delay: 80 });
-  await sleep(500);
+  await sleep(400);
 
   let submitBtn = null;
-  for (const sel of submitSelectors) {
+  for (const sel of ['button[type="submit"]', 'input[type="submit"]', "form button"]) {
     try {
       submitBtn = await page.$(sel);
-      if (submitBtn) {
-        log(`Found submit button: ${sel}`);
-        break;
-      }
+      if (submitBtn) { log(`Found submit button: ${sel}`); break; }
     } catch {}
   }
 
   if (submitBtn) {
     await submitBtn.click();
   } else {
-    log("No submit button found, pressing Enter on password field...");
     await passwordField.press("Enter");
   }
 
   log("Waiting for navigation after login...");
-  await sleep(4000);
+  await sleep(5000);
 
   const url = page.url();
   log(`After login, current URL: ${url}`);
   return true;
 }
 
-async function keepAfkAlive(page) {
-  log("Starting AFK keep-alive loop...");
+async function clickAfkIfAvailable(page) {
+  const afkSelectors = [
+    'a[href*="afk" i]',
+    'button:has-text("AFK")',
+    '[class*="afk" i]',
+    '[id*="afk" i]',
+    'a[href*="/afk"]',
+  ];
+
+  for (const sel of afkSelectors) {
+    try {
+      const el = await page.$(sel);
+      if (el) {
+        log(`Found AFK element (${sel}), clicking it...`);
+        await el.click();
+        await sleep(3000);
+        return true;
+      }
+    } catch {}
+  }
+  return false;
+}
+
+async function keepAlive(page) {
+  log("Starting AFK keep-alive loop (every 30s)...");
+  log("=========================================");
 
   let tick = 0;
   while (true) {
@@ -132,33 +126,50 @@ async function keepAfkAlive(page) {
       const url = page.url();
 
       if (!url.includes("vektalnodes.in")) {
-        log("Unexpected page, navigating back to AFK...");
-        await page.goto(AFK_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+        log("Unexpected redirect, going back to earn page...");
+        await page.goto(EARN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
         await sleep(3000);
         continue;
       }
 
-      if (!url.includes("/afk")) {
-        log(`Not on AFK page (${url}), navigating to /afk...`);
-        await page.goto(AFK_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await sleep(3000);
+      if (url.includes("/login")) {
+        log("Session expired — re-logging in...");
+        const ok = await tryLogin(page);
+        if (ok) {
+          await sleep(3000);
+          await page.goto(EARN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+          await sleep(3000);
+        }
         continue;
       }
 
       await page.evaluate(() => {
-        window.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: Math.random() * 500, clientY: Math.random() * 500 }));
+        window.dispatchEvent(new MouseEvent("mousemove", {
+          bubbles: true,
+          clientX: 200 + Math.floor(Math.random() * 300),
+          clientY: 200 + Math.floor(Math.random() * 300),
+        }));
         document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Shift" }));
+        document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+        Object.defineProperty(document, "hidden", { value: false, writable: true });
+        Object.defineProperty(document, "visibilityState", { value: "visible", writable: true });
       });
 
       await page.mouse.move(
-        200 + Math.floor(Math.random() * 200),
-        200 + Math.floor(Math.random() * 200)
+        200 + Math.floor(Math.random() * 300),
+        200 + Math.floor(Math.random() * 300)
       );
 
       const title = await page.title().catch(() => "unknown");
-      log(`[Tick ${tick}] AFK active — page: "${title}" | url: ${url}`);
+      log(`[Tick ${tick}] Active — "${title}" | ${url}`);
+
+      if (tick % 5 === 0) {
+        log("Reloading earn page to keep session fresh...");
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+        await sleep(3000);
+      }
     } catch (err) {
-      log(`[Tick ${tick}] Error in keep-alive: ${err.message}`);
+      log(`[Tick ${tick}] Error: ${err.message} — retrying next cycle`);
     }
 
     await sleep(30000);
@@ -166,10 +177,12 @@ async function keepAfkAlive(page) {
 }
 
 (async () => {
-  log("Launching browser...");
+  log("=== AFK Bot Starting ===");
+  log(`Target: ${BASE_URL}`);
 
   const browser = await puppeteer.launch({
     headless: "new",
+    executablePath: process.env.CHROMIUM_PATH || "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
@@ -181,7 +194,6 @@ async function keepAfkAlive(page) {
   });
 
   const page = await browser.newPage();
-
   await page.setViewport({ width: 1280, height: 800 });
   await page.setUserAgent(
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -192,52 +204,40 @@ async function keepAfkAlive(page) {
     await dialog.dismiss();
   });
 
+  process.on("SIGINT", async () => {
+    log("Shutting down bot...");
+    await browser.close();
+    process.exit(0);
+  });
+
   try {
-    log(`Navigating to ${LOGIN_URL} ...`);
+    log(`Opening ${LOGIN_URL} ...`);
     await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
     await sleep(2000);
 
     const currentUrl = page.url();
-    log(`Current URL: ${currentUrl}`);
-
-    const isAlreadyLoggedIn =
-      currentUrl.includes("/dashboard") ||
-      currentUrl.includes("/earn") && !currentUrl.includes("login");
-
-    let loginDone = false;
+    log(`Landed on: ${currentUrl}`);
 
     const pageContent = await page.content();
-    const hasLoginForm =
-      pageContent.includes('type="password"') ||
-      pageContent.includes("login") ||
-      pageContent.includes("signin");
+    const needsLogin = pageContent.includes('type="password"') || currentUrl.includes("/login");
 
-    if (hasLoginForm) {
-      loginDone = await tryLogin(page);
+    if (needsLogin) {
+      await tryLogin(page);
     } else {
-      log("No login form detected — assuming already logged in or not needed.");
-      loginDone = true;
-    }
-
-    if (!loginDone) {
-      log("[WARN] Login may have failed. Attempting to proceed to /afk anyway...");
+      log("Already logged in, skipping login step.");
     }
 
     await sleep(2000);
 
-    log(`Navigating to AFK page: ${AFK_URL}`);
-    await page.goto(AFK_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-    await sleep(3000);
+    const postLoginUrl = page.url();
+    log(`Session established. Current page: ${postLoginUrl}`);
 
-    const afkUrl = page.url();
-    const afkTitle = await page.title().catch(() => "unknown");
-    log(`On page: "${afkTitle}" — ${afkUrl}`);
-
-    if (!afkUrl.includes("/afk")) {
-      log("[WARN] Not on /afk page. The bot will keep trying to stay on it.");
+    const afkFound = await clickAfkIfAvailable(page);
+    if (!afkFound) {
+      log("No AFK button found — staying on earn page and keeping session alive.");
     }
 
-    await keepAfkAlive(page);
+    await keepAlive(page);
   } catch (err) {
     log(`Fatal error: ${err.message}`);
     await browser.close();
