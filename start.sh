@@ -40,7 +40,8 @@ fi
 
 echo "[3/4] Installing Node dependencies (skipping Chromium download)..."
 cd "$BOT_DIR"
-PUPPETEER_SKIP_DOWNLOAD=true npm install --silent
+rm -rf node_modules package-lock.json
+PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund
 echo "Dependencies installed."
 
 echo "[4/4] Detecting Chromium..."
