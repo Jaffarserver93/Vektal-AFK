@@ -565,15 +565,16 @@ async function runLinkPaysCycle(page, cycleNum) {
     return { success: false, waitMs: 3_600_000, dailyLimitHit: true };
   }
 
-  // Slot not yet open
-  if (status.cooldownSec > 0) {
-    const h = Math.floor(status.cooldownSec / 3600);
-    const m = Math.floor((status.cooldownSec % 3600) / 60);
-    log(`⏳ Next slot opens in ${h}h ${m}m — sleeping until ${new Date(Date.now() + status.cooldownSec * 1000).toLocaleTimeString()}`);
-    return { success: false, waitMs: (status.cooldownSec + 30) * 1000 };
-  }
-
+  // Button not available and there's a cooldown — slot not open yet
+  // NOTE: when available=true, the cooldown shown is for the NEXT slot after this one.
+  // Do NOT block here if the button is already clickable.
   if (!status.available) {
+    if (status.cooldownSec > 0) {
+      const h = Math.floor(status.cooldownSec / 3600);
+      const m = Math.floor((status.cooldownSec % 3600) / 60);
+      log(`⏳ Next slot opens in ${h}h ${m}m — sleeping until ${new Date(Date.now() + status.cooldownSec * 1000).toLocaleTimeString()}`);
+      return { success: false, waitMs: (status.cooldownSec + 30) * 1000 };
+    }
     log("LinkPays button not available — retrying in 5 minutes.");
     return { success: false, waitMs: 300_000 };
   }
