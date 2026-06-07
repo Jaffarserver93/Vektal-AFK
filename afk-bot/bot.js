@@ -984,140 +984,56 @@ async function runLinkPaysCycle(page, cycleNum) {
     await sleep(1000);
     await doLogin(page);
 
-    // ── Main loop ─────────────────────────────────────────────────────
+    // ── Main loop — runs every 310 seconds, no slot cooldown ─────────
+    const CYCLE_INTERVAL_MS = 310_000;
     let cycleNum = 0;
-    let afkTick  = 0;
 
-    // Load persisted slot timestamps — each entry = when that slot was last used
-    let slotLog = loadSlotLog();
-    log(`\n[Slots] Loaded ${slotLog.length} slot(s) from log. Active in last 24h: ${activeSlots(slotLog).length}`);
-    logSlotStatus(slotLog);
-
-    // Determine first wake time from local slot log
-    let nextCycleAt = Date.now() + msUntilNextSlot(slotLog);
-    if (nextCycleAt > Date.now()) {
-      const wakeAt = new Date(nextCycleAt).toLocaleTimeString();
-      log(`[Slots] Next free slot opens at ${wakeAt} — sleeping until then.`);
-    } else {
-      log("[Slots] A slot is free now — starting cycle immediately.");
-    }
-
-    log(`\nBot running. Will earn up to ${MAX_DAILY} × 12 = ${MAX_DAILY * 12} coins/day.`);
-    log("Press Ctrl+C to stop.\n");
+    log(`\nBot running — cycle every ${CYCLE_INTERVAL_MS / 1000}s. Press Ctrl+C to stop.\n`);
 
     while (true) {
-      const now = Date.now();
+      cycleNum++;
+      log(`\n[Tick ${cycleNum}] Starting earn cycle at ${new Date().toLocaleTimeString()}`);
 
-      // ── LinkPays cycle ───────────────────────────────────────────
-      if (now >= nextCycleAt) {
-        // Double-check local slot log — confirm a slot is actually free
-        const waitMs = msUntilNextSlot(slotLog);
-        if (waitMs > 0) {
-          const wakeAt = new Date(Date.now() + waitMs).toLocaleTimeString();
-          log(`[Slots] All ${MAX_DAILY} slots still active — next opens at ${wakeAt}`);
-          nextCycleAt = Date.now() + waitMs;
-        } else {
-          cycleNum++;
-          try {
-            const res = await runLinkPaysCycle(page, cycleNum);
-            if (res.success) {
-              // Record the slot use — this slot reopens exactly 24h from now
-              slotLog = recordSlotUse(slotLog);
-              const active = activeSlots(slotLog);
-              log(`[Slots] Slot recorded. ${active.length}/${MAX_DAILY} used in last 24h.`);
-              logSlotStatus(slotLog);
-
-              // Schedule next cycle: either immediately (slot free) or when oldest slot expires
-              const nextWait = msUntilNextSlot(slotLog);
-              if (nextWait === 0) {
-                nextCycleAt = Date.now() + 30_000;  // small buffer then run again
-                log(`[Slots] Another slot is free — next cycle in 30s.`);
-              } else {
-                nextCycleAt = Date.now() + nextWait;
-                const wakeAt = new Date(nextCycleAt).toLocaleTimeString();
-                log(`⏳ Next slot opens at ${wakeAt} — sleeping until then.`);
-              }
-            } else if (res.waitMs > 0) {
-              // Page says wait — but also check our local slot log
-              const localWait = msUntilNextSlot(slotLog);
-              const effectiveWait = localWait > 0 ? Math.max(res.waitMs, localWait) : res.waitMs;
-              nextCycleAt = Date.now() + effectiveWait;
-              log(`Waiting ${Math.round(effectiveWait / 1000)}s before next attempt (page: ${Math.round(res.waitMs/1000)}s, local slot: ${Math.round(localWait/1000)}s)...`);
-            } else {
-              nextCycleAt = Date.now() + 60_000;
-            }
-          } catch (err) {
-            log(`Cycle ${cycleNum} ERROR: ${err.message}`);
-            nextCycleAt = Date.now() + 60_000;
-          }
-
-          // Return to /earn after cycle
-          try {
-            if (!page.url().includes("vektalnodes.in/earn")) {
-              await safeGoto(page, `${SITE}/earn`, 30000);
-              await waitForCF(page, 15000);
-            }
-          } catch {}
+      try {
+        // Ensure we're on /earn before each cycle
+        if (!page.url().includes(`${SITE}/earn`)) {
+          await safeGoto(page, `${SITE}/earn`, 30000);
+          await waitForCF(page, 15000);
+          await ensureLoggedIn(page).catch(() => {});
         }
+
+        const res = await runLinkPaysCycle(page, cycleNum);
+
+        if (res.success) {
+          log(`[Tick ${cycleNum}] ✅ Cycle complete — earned 12 coins. Waiting ${CYCLE_INTERVAL_MS / 1000}s...`);
+        } else {
+          log(`[Tick ${cycleNum}] ⚠️  Cycle did not earn coins (site may be at daily limit). Waiting ${CYCLE_INTERVAL_MS / 1000}s...`);
+        }
+      } catch (err) {
+        log(`[Tick ${cycleNum}] ERROR: ${err.message}`);
+        // On error, ensure we're back on earn page
+        try {
+          await safeGoto(page, `${SITE}/earn`, 30000);
+          await waitForCF(page, 15000);
+          await ensureLoggedIn(page).catch(() => {});
+        } catch {}
       }
 
-      // ── AFK keep-alive tick ──────────────────────────────────────
-      afkTick++;
-      await keepAliveOnce(page).catch(() => {});
-
-      // Reload /earn for fresh status
+      // Return to /earn and log current coin balance
       try {
         if (!page.url().includes(`${SITE}/earn`)) {
           await safeGoto(page, `${SITE}/earn`, 30000);
-        } else {
-          await Promise.race([
-            page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {}),
-            new Promise((r) => setTimeout(r, 33000)),
-          ]);
+          await waitForCF(page, 10000);
+          await ensureLoggedIn(page).catch(() => {});
         }
-        await waitForCF(page, 10000);
-        // Auto-recover if session expired during cooldown wait
-        await ensureLoggedIn(page).catch((e) => log(`[AutoLogin] Re-login failed: ${e.message}`));
+        const coins = await getCoins(page).catch(() => "?");
+        const liveStatus = await getLinkPaysStatus(page).catch(() => null);
+        const usage = liveStatus ? `${liveStatus.usageToday}/${liveStatus.maxUsage}` : "?/?";
+        log(`[Status] Coins: ${coins} | LinkPays usage: ${usage} | Next cycle in ${CYCLE_INTERVAL_MS / 1000}s`);
       } catch {}
 
-      const liveStatus = await getLinkPaysStatus(page).catch(() => null);
-      const coins      = await getCoins(page).catch(() => "?");
-      const secToNext  = Math.max(0, Math.round((nextCycleAt - Date.now()) / 1000));
-      const activeNow  = activeSlots(slotLog).length;
-      const usageStr   = liveStatus
-        ? `${liveStatus.usageToday}/${liveStatus.maxUsage}`
-        : `${activeNow}/${MAX_DAILY}`;
-      log(`[AFK tick ${afkTick}] Coins: ${coins} | Usage: ${usageStr} | Next LP cycle: ${secToNext > 0 ? secToNext + "s" : "NOW"}`);
-
-      // If page shows a slot-open time, cross-check with our local tracker
-      // and use whichever is later (safer — avoids wasting a cycle that will be rejected)
-      if (liveStatus && liveStatus.cooldownSec > 0) {
-        const pageWaitMs  = liveStatus.cooldownSec * 1000;
-        const localWaitMs = msUntilNextSlot(slotLog);
-        const bestWaitMs  = Math.max(pageWaitMs, localWaitMs);
-        const wakeAt      = new Date(Date.now() + bestWaitMs).toLocaleTimeString();
-        const isFull      = liveStatus.usageToday >= liveStatus.maxUsage;
-        const label       = isFull
-          ? `💤 Daily limit (${liveStatus.usageToday}/${liveStatus.maxUsage}) — next slot at ${wakeAt}`
-          : `⏳ Next slot in ${Math.floor(bestWaitMs / 60000)}m — sleeping until ${wakeAt}`;
-        log(label);
-        nextCycleAt = Date.now() + bestWaitMs;
-        await sleep(60_000);
-      } else if (liveStatus && liveStatus.usageToday >= liveStatus.maxUsage) {
-        // Page says full but no timer — trust local slot log
-        const localWaitMs = msUntilNextSlot(slotLog);
-        if (localWaitMs > 0) {
-          const wakeAt = new Date(Date.now() + localWaitMs).toLocaleTimeString();
-          log(`💤 Daily limit — local slot opens at ${wakeAt}`);
-          nextCycleAt = Date.now() + localWaitMs;
-        } else {
-          log(`💤 Daily limit — no timer visible, re-checking in 1h`);
-          nextCycleAt = Date.now() + 3_600_000;
-        }
-        await sleep(60_000);
-      } else {
-        await sleep(60_000);
-      }
+      log(`[Tick ${cycleNum}] Sleeping ${CYCLE_INTERVAL_MS / 1000}s until next cycle...`);
+      await sleep(CYCLE_INTERVAL_MS);
     }
 
   } catch (err) {
