@@ -352,6 +352,60 @@ async function keepAliveOnce(page) {
   await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
 }
 
+// ── doLogin — reusable login flow (called on startup and on session expiry) ───
+async function doLogin(page) {
+  log("[Login] Navigating to login page...");
+  await safeGoto(page, `${SITE}/login`, 60000);
+  await waitForCF(page);
+  await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 30000 }).catch(() => {});
+  await sleep(600);
+
+  let emailEl = await page.$('input[type="email"], input[name="email"]');
+  if (!emailEl) {
+    log("[Login] Email input not found — reloading...");
+    await safeGoto(page, `${SITE}/login`, 60000);
+    await waitForCF(page); await sleep(800);
+    emailEl = await page.$('input[type="email"], input[name="email"]');
+  }
+  if (!emailEl) throw new Error("No email input on login page");
+
+  await emailEl.click({ clickCount: 3 });
+  await emailEl.type(EMAIL, { delay: 55 });
+  const passEl = await page.$('input[type="password"]');
+  if (!passEl) throw new Error("No password input on login page");
+  await passEl.click({ clickCount: 3 });
+  await passEl.type(PASSWORD, { delay: 55 });
+
+  await Promise.allSettled([
+    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
+    page.keyboard.press("Enter"),
+  ]);
+  await waitForCF(page);
+
+  if (page.url().includes("/login")) {
+    await safeGoto(page, `${SITE}/earn`, 30000);
+    await waitForCF(page);
+    if (page.url().includes("/login")) throw new Error("Login failed — still on /login");
+  }
+
+  if (!page.url().includes("/earn")) {
+    await safeGoto(page, `${SITE}/earn`, 30000);
+    await waitForCF(page);
+  }
+  log(`[Login] ✓ Logged in: ${page.url()}`);
+}
+
+// ── ensureLoggedIn — detect session expiry and re-login if needed ─────────────
+async function ensureLoggedIn(page) {
+  const url = page.url();
+  if (url.includes("/login") || url.includes("/logout") || (!url.includes(SITE) && url !== "about:blank")) {
+    log(`⚠️  Session expired (landed on ${url}) — re-logging in...`);
+    await doLogin(page);
+    return true;
+  }
+  return false;
+}
+
 // ── runLinkPaysCycle — exact flow from test-linkpays.js ──────────────────────
 async function runLinkPaysCycle(page, cycleNum) {
   resetStepNum();
@@ -363,6 +417,7 @@ async function runLinkPaysCycle(page, cycleNum) {
   await safeGoto(page, `${SITE}/earn`, 60000);
   log("  [step1] page landed — waiting for CF...");
   await waitForCF(page);
+  await ensureLoggedIn(page);
   await sleep(1000);
   log("  [step1] taking screenshot...");
   await shot(page, "earn-page");
@@ -696,45 +751,7 @@ async function runLinkPaysCycle(page, cycleNum) {
     await safeGoto(page, SITE, 60000);
     await waitForCF(page, 60000);
     await sleep(1000);
-
-    await safeGoto(page, `${SITE}/login`, 60000);
-    await waitForCF(page);
-    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 30000 }).catch(() => {});
-    await sleep(600);
-
-    let emailEl = await page.$('input[type="email"], input[name="email"]');
-    if (!emailEl) {
-      log("Email input not found — reloading...");
-      await safeGoto(page, `${SITE}/login`, 60000);
-      await waitForCF(page); await sleep(800);
-      emailEl = await page.$('input[type="email"], input[name="email"]');
-    }
-    if (!emailEl) throw new Error("No email input on login page");
-
-    await emailEl.click({ clickCount: 3 });
-    await emailEl.type(EMAIL, { delay: 55 });
-    const passEl = await page.$('input[type="password"]');
-    if (!passEl) throw new Error("No password input on login page");
-    await passEl.click({ clickCount: 3 });
-    await passEl.type(PASSWORD, { delay: 55 });
-
-    await Promise.allSettled([
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 30000 }),
-      page.keyboard.press("Enter"),
-    ]);
-    await waitForCF(page);
-
-    if (page.url().includes("/login")) {
-      await safeGoto(page, `${SITE}/earn`, 30000);
-      await waitForCF(page);
-      if (page.url().includes("/login")) throw new Error("Login failed — still on /login");
-    }
-    log(`✓ Logged in: ${page.url()}`);
-
-    if (!page.url().includes("/earn")) {
-      await safeGoto(page, `${SITE}/earn`, 30000);
-      await waitForCF(page);
-    }
+    await doLogin(page);
 
     // ── Main loop ─────────────────────────────────────────────────────
     let successCount = 0;
@@ -795,6 +812,8 @@ async function runLinkPaysCycle(page, cycleNum) {
           ]);
         }
         await waitForCF(page, 10000);
+        // Auto-recover if session expired during cooldown wait
+        await ensureLoggedIn(page).catch((e) => log(`[AutoLogin] Re-login failed: ${e.message}`));
       } catch {}
 
       const liveStatus  = await getLinkPaysStatus(page).catch(() => null);
