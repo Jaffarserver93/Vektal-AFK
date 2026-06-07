@@ -141,17 +141,22 @@ async function waitForCountdown(page, maxMs = 50000, label = "", minMs = 15000) 
   if (!seen) log(`  [${label}] No countdown found — used ${minMs / 1000}s floor.`);
 }
 
-async function clickButton(page, selectors, texts) {
-  return page.evaluate((sels, txts) => {
+async function clickButton(page, selectors, texts, label = "") {
+  const result = await page.evaluate((sels, txts) => {
     for (const s of sels) {
       try { const el = document.querySelector(s); if (el && !el.disabled) { el.click(); return s; } } catch {}
     }
     for (const el of Array.from(document.querySelectorAll("button,a,input[type=submit],[role=button]"))) {
       const t = (el.innerText || el.value || "").toLowerCase();
-      if (txts.some((x) => t.includes(x.toLowerCase()))) { if (!el.disabled) { el.click(); return "text:" + t.slice(0,30); } }
+      if (txts.some((x) => t.includes(x.toLowerCase()))) { if (!el.disabled) { el.click(); return "text:" + t.slice(0, 40); } }
     }
     return null;
   }, selectors, texts).catch(() => null);
+  if (label) {
+    if (result) log(`  ✓ Clicked ${label} (${result})`);
+    else        log(`  ✗ ${label} not found`);
+  }
+  return result;
 }
 
 // ── Login ─────────────────────────────────────────────────────────────────────
@@ -255,33 +260,33 @@ async function getLinkPaysStatus(page) {
 }
 
 // ── Handle one evspec/rank1st ad page ─────────────────────────────────────────
-async function handleAdPage(page, num) {
-  log(`\n── Ad page ${num} — ${page.url()} ──`);
+async function handleAdPage(page, label) {
+  log(`\n── Ad page [${label}] — ${page.url()} ──`);
 
-  // Wait for the countdown (15s floor)
-  await waitForCountdown(page, 35000, `ad${num}`, 15000);
+  // Wait for countdown (15s floor)
+  await waitForCountdown(page, 35000, label, 15000);
 
   // Scroll to reveal buttons
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
   await sleep(800);
 
   // I'm Not Robot (optional)
-  const notRobot = await clickButton(page, ["button.tp-unlock-btn", ".tp-unlock-btn"], ["not robot", "i'm not", "human"]);
-  if (notRobot) { log(`  ✓ I'm Not Robot (${notRobot})`); await sleep(2000); }
+  const notRobot = await clickButton(page, ["button.tp-unlock-btn", ".tp-unlock-btn"], ["not robot", "i'm not", "human"], "I'm Not Robot");
+  if (notRobot) await sleep(2000);
 
+  // Scroll again before Verify
   await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
   await sleep(600);
 
   // Verify
-  const verify = await clickButton(page, ["button.tp-btn.tp-blue", "button.tp-btn"], ["verify", "verifiy"]);
-  if (verify) { log(`  ✓ Verify (${verify})`); await sleep(1500); }
+  const verified = await clickButton(page, ["button.tp-btn.tp-blue", "button.tp-btn"], ["verify", "verifiy"], "Verify");
+  if (verified) await sleep(1500);
 
   // Continue
-  const cont = await clickButton(page, ["button.tp-btn.tp-blue", "button.tp-btn", ".tp-btn"], ["continue", "next", "proceed"]);
-  if (cont) { log(`  ✓ Continue (${cont})`); }
+  await clickButton(page, ["button.tp-btn.tp-blue", "button.tp-btn", ".tp-btn"], ["continue", "next", "proceed"], "Continue");
 
   await sleep(3000);
-  log(`  → ${page.url()}`);
+  log(`  → After ad page: ${page.url()}`);
 }
 
 // ── One full LinkPays earn cycle ──────────────────────────────────────────────
@@ -289,14 +294,15 @@ async function runLinkPaysCycle(page, cycleNum) {
   log(`\n${"═".repeat(55)}`);
   log(`LINKPAYS CYCLE ${cycleNum} START`);
 
-  // Go to /earn
+  // ── STEP 1: Navigate to /earn ─────────────────────────────────────────
+  log("\n── STEP 1: Navigate to /earn ──");
   await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
   await waitForCF(page);
   await sleep(1000);
 
   const coinsBefore = await getCoins(page);
   const status = await getLinkPaysStatus(page);
-  log(`Coins: ${coinsBefore} | LP: available=${status.available} usage=${status.usageToday}/${status.maxUsage} cooldown=${status.cooldownSec}s`);
+  log(`Coins before: ${coinsBefore} | LP: available=${status.available} usage=${status.usageToday}/${status.maxUsage} cooldown=${status.cooldownSec}s`);
 
   if (!status.available) {
     if (status.cooldownSec > 0) {
@@ -309,23 +315,26 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   const cycleStart = Date.now();
 
-  // Click "Open LinkPays" — fires POST /earn/linkpays/start → 302 → linkpays.in
-  log("Clicking Open LinkPays...");
+  // ── STEP 2: Click "Open LinkPays" ────────────────────────────────────
+  log("\n── STEP 2: Click Open LinkPays ──");
+  log("  Clicking button — POST /earn/linkpays/start will fire + redirect to linkpays.in...");
   const lpBtn = await page.$('button.button-primary[type="submit"], button.button.button-primary');
-  if (!lpBtn) { log("ERROR: LinkPays button not found"); return { success: false, waitMs: 30000 }; }
+  if (!lpBtn) { log("ERROR: LinkPays button not found on /earn page"); return { success: false, waitMs: 30000 }; }
   await lpBtn.click();
 
   // Wait for MAIN TAB to navigate to linkpays.in
-  const linkpaysUrl = await waitForUrl(page, ["linkpays.in"], 20000, "linkpays");
+  log("  Waiting for MAIN TAB to navigate to linkpays.in...");
+  const linkpaysUrl = await waitForUrl(page, ["linkpays.in"], 20000, "main-tab");
   if (!linkpaysUrl) {
-    log(`WARNING: Main tab did not reach linkpays.in (current: ${page.url()})`);
+    log(`  Current URL: ${page.url()} — did not reach linkpays.in in 20s`);
     return { success: false, waitMs: 30000 };
   }
-  log(`✓ On linkpays.in`);
+  log(`  ✓ On linkpays.in: ${linkpaysUrl}`);
   await waitForCF(page, 30000);
   await sleep(1000);
 
-  // Decode proceed() target and call it after 4s
+  // ── STEP 3: proceed() on linkpays.in ─────────────────────────────────
+  log("\n── STEP 3: proceed() on linkpays.in ──");
   const proceedTarget = await page.evaluate(() => {
     const scripts = Array.from(document.querySelectorAll("script"));
     for (const s of scripts) {
@@ -334,24 +343,24 @@ async function runLinkPaysCycle(page, cycleNum) {
     }
     return "";
   }).catch(() => "");
-  log(`proceed() target: ${proceedTarget || "(not found)"}`);
+  log(`  proceed() target: ${proceedTarget || "(not found yet)"}`);
 
-  await sleep(4000);
-  const called = await page.evaluate(() => {
+  // Wait 4s for auto-proceed, then call manually
+  await sleep(4000, "auto-proceed timer");
+  const proceedCalled = await page.evaluate(() => {
     if (typeof proceed === "function") { proceed(); return true; }
     return false;
   }).catch(() => false);
-  log(`proceed() called: ${called}`);
+  log(`  proceed() manually called: ${proceedCalled}`);
 
-  // Wait for ad site
+  // ── STEP 4: Navigate to ad site ──────────────────────────────────────
+  log("\n── STEP 4: Navigate to ad site ──");
   let adUrl = await waitForUrl(page, ["evspec.in","rank1st.in","savepe.in","bookyourhotel.in","earn/linkpays/complete"], 30000, "ad-site");
   if (!adUrl) {
     const u = page.url();
-    log(`WARNING: Did not reach ad site (current: ${u})`);
+    log(`  WARNING: Still on ${u} — checking if still linkpays.in...`);
     if (u.includes("linkpays.in")) {
-      // Fallback: try clicking "Continue to next step" if stuck on linkpays
-      log("  Still on linkpays.in — trying Continue button...");
-      await clickButton(page, ["button.btn","a.btn",".btn"], ["continue","next step"]);
+      await clickButton(page, ["button.btn","a.btn",".btn"], ["continue","next step"], "Continue to next step");
       await sleep(5000);
       adUrl = page.url();
       log(`  After continue click: ${adUrl}`);
@@ -362,16 +371,18 @@ async function runLinkPaysCycle(page, cycleNum) {
       return { success: false, waitMs: 30000 };
     }
   }
-  log(`✓ Ad site: ${adUrl}`);
+  log(`  ✓ Ad site: ${adUrl}`);
 
-  // Loop through ad pages
+  // ── STEP 5: Ad page loop ──────────────────────────────────────────────
+  log("\n── STEP 5: Ad page loop ──");
   let adsDone = 0, prevUrl = "";
   for (let i = 1; i <= 20; i++) {
     const u = page.url();
-    log(`  [loop ${i}] URL: ${u}`);
+    log(`\n  [loop ${i}] URL: ${u}`);
 
-    if (u.includes("vektalnodes.in")) { log("✓ Back on vektalnodes.in"); break; }
-    if (u.includes("bookyourhotel.in")) { log("→ bookyourhotel.in reached"); break; }
+    if (u.includes("vektalnodes.in")) { log("  ✓ Back on vektalnodes.in!"); break; }
+    if (u.includes("bookyourhotel.in")) { log("  → On bookyourhotel.in — jumping to gateway step"); break; }
+
     if (u.includes("#google_vignette") || u.includes("google_vignette")) {
       log("  Google vignette — waiting up to 10s for auto-redirect...");
       for (let j = 0; j < 10; j++) {
@@ -390,7 +401,7 @@ async function runLinkPaysCycle(page, cycleNum) {
 
     if (isAd) {
       adsDone++;
-      await handleAdPage(page, adsDone);
+      await handleAdPage(page, `p${adsDone}`);
     } else {
       const waitMs = u === prevUrl ? 8000 : 5000;
       log(`  Not an ad page — waiting ${waitMs / 1000}s for auto-redirect...`);
@@ -399,54 +410,68 @@ async function runLinkPaysCycle(page, cycleNum) {
     prevUrl = u;
   }
 
-  // bookyourhotel.in — final gateway
+  // ── STEP 6: bookyourhotel.in — Get Link ──────────────────────────────
+  log("\n── STEP 6: bookyourhotel.in (final gateway) ──");
   let onHotel = false;
   for (let i = 0; i < 20; i++) {
     const u = page.url();
     if (u.includes("bookyourhotel.in")) { onHotel = true; break; }
-    if (u.includes("vektalnodes.in")) break;
+    if (u.includes("vektalnodes.in")) { log(`  Already back on vektalnodes: ${u}`); break; }
     await sleep(1000);
   }
 
   if (onHotel) {
-    log(`\n── bookyourhotel.in — waiting countdown + 240s minimum ──`);
+    log(`  On bookyourhotel.in: ${page.url()}`);
 
-    // Wait for page countdown (30s floor)
+    // Wait for bookyourhotel countdown (30s minimum)
     await waitForCountdown(page, 50000, "hotel", 30000);
 
-    // Enforce 240s total from button click
+    // Enforce 240s total minimum from button click
     const elapsed = Math.floor((Date.now() - cycleStart) / 1000);
     if (elapsed < MIN_FLOW_S) {
       const need = (MIN_FLOW_S - elapsed) * 1000;
-      log(`Total elapsed: ${elapsed}s — waiting ${MIN_FLOW_S - elapsed}s more for server minimum...`);
-      await sleep(need);
+      log(`  Total elapsed: ${elapsed}s — waiting ${MIN_FLOW_S - elapsed}s more for server minimum...`);
+      await sleep(need, "server 240s minimum");
     } else {
-      log(`Total elapsed: ${elapsed}s — past 240s minimum ✓`);
+      log(`  Total elapsed: ${elapsed}s — past 240s minimum ✓`);
     }
 
-    // Click GET LINK (exact text match only)
+    // Click "GET LINK" — exact text match, then CSS fallback
     const gotLink = await page.evaluate(() => {
-      const all = Array.from(document.querySelectorAll("a,button,input[type=button],input[type=submit]"));
+      const all = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
       for (const el of all) {
         const txt = ((el.innerText || el.value || el.textContent) || "").trim().toLowerCase();
-        if (txt === "get link" || txt === "get links" || txt === "getlink" || txt.startsWith("get link")) {
+        if (txt === "get link" || txt === "get links" || txt === "getlink") {
+          el.click(); return el.innerText || el.value || txt;
+        }
+      }
+      for (const el of all) {
+        const txt = ((el.innerText || el.value || el.textContent) || "").trim().toLowerCase();
+        if (txt.startsWith("get link")) {
           el.click(); return el.innerText || el.value || txt;
         }
       }
       return null;
     }).catch(() => null);
 
-    if (gotLink) log(`✓ Clicked GET LINK: "${gotLink}"`);
-    else { log("✗ GET LINK not found — trying CSS fallback..."); await clickButton(page, ["#get-link",".get-link-btn","[id*='get-link']"], []); }
+    if (gotLink) log(`  ✓ Clicked GET LINK: "${gotLink}"`);
+    else {
+      log("  ✗ GET LINK not found by text — trying CSS fallback...");
+      await clickButton(page, ["#get-link", ".get-link-btn", "[id*='get']", "[class*='get-link']"], [], "Get Link CSS");
+    }
 
+    log("  Waiting for redirect after Get Link...");
     await sleep(8000);
-    log(`After GET LINK: ${page.url()}`);
+    log(`  After GET LINK: ${page.url()}`);
   }
 
-  // Wait for final redirect to vektalnodes.in/earn
+  // ── STEP 7: Final — navigate to /earn and check coins ────────────────
+  log("\n── STEP 7: Final check ──");
   await sleep(5000);
+  log(`  URL after wait: ${page.url()}`);
+
   if (!page.url().includes("vektalnodes.in/earn")) {
-    log("Navigating to /earn to confirm coin credit...");
+    log("  Navigating to /earn to confirm coin credit...");
     try {
       await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
       await waitForCF(page, 30000);
@@ -468,12 +493,16 @@ async function runLinkPaysCycle(page, cycleNum) {
   const statusAfter = await getLinkPaysStatus(page);
   const diff = coinsAfter - coinsBefore;
 
-  log(`\nCoins BEFORE: ${coinsBefore} | AFTER: ${coinsAfter} | DIFF: +${diff}`);
-  log(`Flash: ${statusAfter.flash || "(none)"}`);
+  log(`\n${"═".repeat(50)}`);
+  log(`Coins BEFORE : ${coinsBefore}`);
+  log(`Coins AFTER  : ${coinsAfter}`);
+  log(`Diff         : +${diff}`);
+  log(`Flash msg    : ${statusAfter.flash || "(none)"}`);
 
-  const success = diff > 0 || statusAfter.flash.includes("coin");
+  const success = diff > 0 || statusAfter.flash.toLowerCase().includes("coin");
   if (success) log(`✅ CYCLE ${cycleNum} SUCCESS — +${diff} coins (total: ${coinsAfter})`);
   else         log(`⚠️  CYCLE ${cycleNum} — No coins detected. Flash: "${statusAfter.flash}"`);
+  log(`${"═".repeat(50)}`);
 
   return { success, waitMs: 0, coinsAfter };
 }
