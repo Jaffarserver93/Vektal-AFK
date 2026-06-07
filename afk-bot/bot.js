@@ -789,11 +789,13 @@ async function runLinkPaysCycle(page, cycleNum) {
           : `⏳ Next slot in ${Math.floor(liveStatus.cooldownSec / 3600)}h ${Math.floor((liveStatus.cooldownSec % 3600) / 60)}m — sleeping until ${wakeAt}`;
         log(label);
         nextCycleAt = Date.now() + slotMs;
-        await sleep(slotMs, "slot wait");
+        // Tick every 60s so the bot stays alive and logs progress during the wait
+        await sleep(60_000);
       } else if (realFull) {
         log(`💤 Daily limit (${liveStatus.usageToday}/${liveStatus.maxUsage}) — no timer visible, re-checking in 1h`);
         nextCycleAt = Date.now() + 3_600_000;
-        await sleep(3_600_000, "daily limit wait");
+        // Tick every 60s so the bot stays alive and logs progress during the wait
+        await sleep(60_000);
       } else {
         await sleep(60_000);
       }
