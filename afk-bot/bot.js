@@ -688,10 +688,10 @@ async function runLinkPaysCycle(page, cycleNum) {
     }
 
     // Once 4 ad pages are done, wait for bookyourhotel.in redirect
-    // If stuck >3min after that, navigate directly
+    // If stuck >45s after that, navigate directly (loop max=40 so 180s is never reached)
     if (adPagesDone >= MAX_AD_PAGES) {
       totalStuckMs += 3000;
-      if (totalStuckMs >= 180_000) {
+      if (totalStuckMs >= 45_000) {
         log(`  ⚠️  Still not on bookyourhotel.in after ${totalStuckMs / 1000}s — navigating directly...`);
         await safeGoto(page, "https://bookyourhotel.in/", 30000);
         break;
@@ -766,6 +766,17 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   // ── STEP 6: bookyourhotel.in — Get Link ─────────────────────────────
   log("\n── STEP 6: bookyourhotel.in (final gateway) ──");
+
+  // Post-loop safety: if 4 ad pages done but redirect to bookyourhotel never came, go there directly
+  {
+    const u = page.url();
+    if (adPagesDone >= MAX_AD_PAGES && !u.includes("bookyourhotel.in") && !u.includes("vektalnodes.in")) {
+      log(`  ⚠️  Loop exited but still on ${u} — navigating directly to bookyourhotel.in...`);
+      await safeGoto(page, "https://bookyourhotel.in/", 30000);
+      await sleep(3000);
+    }
+  }
+
   let onHotel = false;
   for (let i = 0; i < 20; i++) {
     const u = page.url();
