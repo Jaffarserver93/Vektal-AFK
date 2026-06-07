@@ -47,3 +47,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Never commit Replit-generated lockfiles — they contain package-firewall.replit.local URLs
+# that break npm install on external servers
+afk-bot/package-lock.json
