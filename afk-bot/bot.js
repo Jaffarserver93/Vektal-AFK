@@ -342,7 +342,19 @@ async function runLinkPaysCycle(page, cycleNum) {
   const status = await getLinkPaysStatus(page);
   log(`Coins before: ${coinsBefore} | LP: available=${status.available} usage=${status.usageToday}/${status.maxUsage} cooldown=${status.cooldownSec}s`);
 
-  // Respect cooldown even if button appears enabled (slot not open yet)
+  // ── Daily limit 10/10 hit — sleep until rolling window re-opens ──────
+  if (status.usageToday >= status.maxUsage) {
+    if (status.cooldownSec > 0) {
+      const h = Math.floor(status.cooldownSec / 3600);
+      const m = Math.floor((status.cooldownSec % 3600) / 60);
+      log(`💤 Daily limit reached (${status.usageToday}/${status.maxUsage}). Next slot opens in ${h}h ${m}m — sleeping.`);
+      return { success: false, waitMs: (status.cooldownSec + 60) * 1000, dailyLimitHit: true };
+    }
+    log(`💤 Daily limit reached (${status.usageToday}/${status.maxUsage}). No slot timer visible — sleeping 1h then re-checking.`);
+    return { success: false, waitMs: 3600_000, dailyLimitHit: true };
+  }
+
+  // ── Slot not yet open (rolling cooldown between cycles) ───────────────
   if (status.cooldownSec > 0) {
     const h = Math.floor(status.cooldownSec / 3600);
     const m = Math.floor((status.cooldownSec % 3600) / 60);
@@ -351,8 +363,8 @@ async function runLinkPaysCycle(page, cycleNum) {
   }
 
   if (!status.available) {
-    log("LinkPays not available (daily limit hit or disabled).");
-    return { success: false, waitMs: 0 };
+    log("LinkPays button not available — retrying in 5 minutes.");
+    return { success: false, waitMs: 300_000 };
   }
 
   const cycleStart = Date.now();
@@ -415,22 +427,30 @@ async function runLinkPaysCycle(page, cycleNum) {
   }
   log(`  ✓ Ad site: ${adUrl}`);
 
-  // ── STEP 5: Ad page loop ──────────────────────────────────────────────
+  // ── STEP 5: Ad page loop (max 4 pages) ───────────────────────────────
   log("\n── STEP 5: Ad page loop ──");
-  let adsDone = 0, prevUrl = "";
-  for (let i = 1; i <= 20; i++) {
+  const MAX_AD_PAGES = 4;
+  let adsDone = 0, prevUrl = "", sameUrlStreak = 0;
+  for (let i = 1; i <= 30; i++) {
     const u = page.url();
     log(`\n  [loop ${i}] URL: ${u}`);
 
-    if (u.includes("vektalnodes.in")) { log("  ✓ Back on vektalnodes.in!"); break; }
-    if (u.includes("bookyourhotel.in")) { log("  → On bookyourhotel.in — jumping to gateway step"); break; }
+    if (u.includes("vektalnodes.in"))  { log("  ✓ Back on vektalnodes.in!"); break; }
+    if (u.includes("bookyourhotel.in")) { log("  → bookyourhotel.in reached"); break; }
 
-    if (u.includes("#google_vignette") || u.includes("google_vignette")) {
+    if (u.includes("google_vignette")) {
       log("  Google vignette — waiting up to 10s for auto-redirect...");
       for (let j = 0; j < 10; j++) {
         await sleep(1000);
-        if (!page.url().includes("google_vignette")) { log(`  → Redirected to: ${page.url()}`); break; }
+        if (!page.url().includes("google_vignette")) { log(`  → Redirected: ${page.url()}`); break; }
       }
+      continue;
+    }
+
+    // Once 4 ad pages are done, stop processing and wait for bookyourhotel.in
+    if (adsDone >= MAX_AD_PAGES) {
+      log(`  ✅ ${MAX_AD_PAGES} ad pages complete — waiting for bookyourhotel.in redirect...`);
+      await sleep(3000);
       continue;
     }
 
@@ -442,11 +462,26 @@ async function runLinkPaysCycle(page, cycleNum) {
     )).catch(() => false);
 
     if (isAd) {
+      sameUrlStreak = 0;
       adsDone++;
+      log(`  → Ad page ${adsDone}/${MAX_AD_PAGES}`);
       await handleAdPage(page, `p${adsDone}`);
     } else {
-      const waitMs = u === prevUrl ? 8000 : 5000;
-      log(`  Not an ad page — waiting ${waitMs / 1000}s for auto-redirect...`);
+      // Track how long we're stuck on the same URL
+      if (u === prevUrl) {
+        sameUrlStreak++;
+        if (sameUrlStreak >= 5) {
+          log(`  ⚠️  Stuck on same URL for ${sameUrlStreak} loops — reloading page...`);
+          await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+          sameUrlStreak = 0;
+          await sleep(3000);
+          continue;
+        }
+      } else {
+        sameUrlStreak = 0;
+      }
+      const waitMs = sameUrlStreak > 0 ? 8000 : 5000;
+      log(`  Not an ad page (streak: ${sameUrlStreak}) — waiting ${waitMs / 1000}s for auto-redirect...`);
       await sleep(waitMs);
     }
     prevUrl = u;
@@ -692,13 +727,24 @@ async function keepAliveOnce(page) {
       const usageStr = liveStatus ? `${liveStatus.usageToday}/${liveStatus.maxUsage}` : `${successCount}/${MAX_DAILY}`;
       log(`[AFK tick ${afkTick}] Coins: ${coins} | Usage: ${usageStr} | Next LP cycle: ${secUntilNext > 0 ? secUntilNext + "s" : "NOW"}`);
 
-      // If page shows a "Next slot opens in Xh Ym" cooldown, sleep the bot for exactly that long
-      if (liveStatus && liveStatus.cooldownSec > 0 && successCount < MAX_DAILY) {
+      // ── Sleep logic based on real page status ────────────────────────
+      const realUsageFull = liveStatus && liveStatus.usageToday >= liveStatus.maxUsage;
+      const hasCooldown   = liveStatus && liveStatus.cooldownSec > 0;
+
+      if (hasCooldown) {
         const slotMs = liveStatus.cooldownSec * 1000;
         const wakeAt = new Date(Date.now() + slotMs).toLocaleTimeString();
-        log(`💤 Next slot opens in ${Math.floor(liveStatus.cooldownSec / 3600)}h ${Math.floor((liveStatus.cooldownSec % 3600) / 60)}m — sleeping until ${wakeAt}`);
+        const reason = realUsageFull
+          ? `💤 Daily limit (${liveStatus.usageToday}/${liveStatus.maxUsage}) — next slot at ${wakeAt}`
+          : `⏳ Next slot opens in ${Math.floor(liveStatus.cooldownSec / 3600)}h ${Math.floor((liveStatus.cooldownSec % 3600) / 60)}m — sleeping until ${wakeAt}`;
+        log(reason);
         nextCycleAt = Date.now() + slotMs;
         await sleep(slotMs, "slot wait");
+      } else if (realUsageFull) {
+        // 10/10 with no slot timer visible — re-check in 1h
+        log(`💤 Daily limit (${liveStatus.usageToday}/${liveStatus.maxUsage}) — no timer visible, re-checking in 1h`);
+        nextCycleAt = Date.now() + 3600_000;
+        await sleep(3600_000, "daily limit wait");
       } else {
         await sleep(60000);
       }

@@ -439,20 +439,15 @@ async function handleAdPage(page, label) {
 
     // ── STEP 5: Loop through ad pages ─────────────────────────────────────
     log("\n── STEP 5: Ad page loop ──");
-    let adPagesDone = 0;
-    let prevLoopUrl = "";
-    for (let i = 1; i <= 20; i++) {
+    const MAX_AD_PAGES = 4;
+    let adPagesDone = 0, prevLoopUrl = "", sameStreak = 0;
+    for (let i = 1; i <= 30; i++) {
       const u = page.url();
       log(`\n  [loop ${i}] URL: ${u}`);
 
-      if (u.includes("vektalnodes.in")) {
-        log("  ✓ Back on vektalnodes.in!");
-        break;
-      }
-      if (u.includes("bookyourhotel.in")) {
-        log("  → On bookyourhotel.in — jumping to gateway step");
-        break;
-      }
+      if (u.includes("vektalnodes.in"))  { log("  ✓ Back on vektalnodes.in!"); break; }
+      if (u.includes("bookyourhotel.in")) { log("  → bookyourhotel.in reached"); break; }
+
       // Google vignette: wait for the auto-redirect
       if (u.includes("#google_vignette") || u.includes("google_vignette")) {
         log("  Google vignette — waiting up to 10s for auto-redirect...");
@@ -463,6 +458,14 @@ async function handleAdPage(page, label) {
         }
         continue;
       }
+
+      // Cap at 4 ad pages — once done, just wait for bookyourhotel.in redirect
+      if (adPagesDone >= MAX_AD_PAGES) {
+        log(`  ✅ ${MAX_AD_PAGES} ad pages complete — waiting for bookyourhotel.in redirect...`);
+        await sleep(3000);
+        continue;
+      }
+
       // Detect ad pages (tp- widget buttons)
       const isAd = await page.evaluate(() => !!(
         document.querySelector("button.tp-unlock-btn") ||
@@ -472,12 +475,25 @@ async function handleAdPage(page, label) {
       )).catch(() => false);
 
       if (isAd) {
+        sameStreak = 0;
         adPagesDone++;
+        log(`  → Ad page ${adPagesDone}/${MAX_AD_PAGES}`);
         await handleAdPage(page, `p${adPagesDone}`);
       } else {
-        // If URL same as previous iteration, page may be slow — wait longer
-        const waitMs = u === prevLoopUrl ? 8000 : 5000;
-        log(`  Not an ad page — waiting ${waitMs / 1000}s for auto-redirect...`);
+        if (u === prevLoopUrl) {
+          sameStreak++;
+          if (sameStreak >= 5) {
+            log(`  ⚠️  Stuck on same URL (${sameStreak}×) — reloading...`);
+            await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+            sameStreak = 0;
+            await sleep(3000);
+            continue;
+          }
+        } else {
+          sameStreak = 0;
+        }
+        const waitMs = sameStreak > 0 ? 8000 : 5000;
+        log(`  Not an ad page (streak: ${sameStreak}) — waiting ${waitMs / 1000}s for auto-redirect...`);
         await sleep(waitMs);
       }
       prevLoopUrl = u;
