@@ -755,13 +755,10 @@ async function runLinkPaysCycle(page, cycleNum) {
       await clickButton(page, ["#get-link", ".get-link-btn", "[id*='get']", "[class*='get-link']"], [], "Get Link CSS");
     }
 
-    log("  Waiting for redirect after Get Link...");
-    // Wait up to 20s for vektalnodes redirect; most of the time it auto-redirects
-    for (let i = 0; i < 20; i++) {
-      await sleep(1000);
-      if (page.url().includes("vektalnodes.in")) { log(`  ✓ Redirected to vektalnodes: ${page.url()}`); break; }
-    }
-    log(`  After Get Link wait: ${page.url()}`);
+    // No auto-redirect after Get Link — navigate back to /earn manually
+    log("  Get Link clicked — navigating to /earn manually...");
+    await sleep(3000);
+    log(`  After Get Link: ${page.url()}`);
     await shot(page, "hotel-after-get-link");
   }
 
