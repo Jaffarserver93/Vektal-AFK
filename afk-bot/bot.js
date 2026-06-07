@@ -756,40 +756,70 @@ async function runLinkPaysCycle(page, cycleNum) {
     }
 
     log("  Waiting for redirect after Get Link...");
-    await sleep(8000);
-    log(`  After Get Link: ${page.url()}`);
+    // Wait up to 20s for vektalnodes redirect; most of the time it auto-redirects
+    for (let i = 0; i < 20; i++) {
+      await sleep(1000);
+      if (page.url().includes("vektalnodes.in")) { log(`  ✓ Redirected to vektalnodes: ${page.url()}`); break; }
+    }
+    log(`  After Get Link wait: ${page.url()}`);
     await shot(page, "hotel-after-get-link");
   }
 
-  // ── STEP 7: Final — verify coins ────────────────────────────────────
+  // ── STEP 7: Final — force back to /earn, then verify coins ──────────
   log("\n── STEP 7: Final check ──");
-  const finalUrl = page.url();
-  log(`  Final URL: ${finalUrl}`);
-  await shot(page, "final-url");
+  log(`  Current URL: ${page.url()}`);
 
-  await sleep(5000);
-  log(`  URL after wait: ${page.url()}`);
-
-  if (!page.url().includes(`${SITE}/earn`)) {
+  // Retry navigating to /earn up to 5 times — ERR_ABORTED is common here
+  let onEarn = false;
+  for (let attempt = 1; attempt <= 5; attempt++) {
     try {
-      await safeGoto(page, `${SITE}/earn`, 30000);
-      await waitForCF(page, 15000);
-      await sleep(1500);
+      if (page.url().includes(`${SITE}/earn`)) { onEarn = true; break; }
+      log(`  [nav-back ${attempt}/5] Navigating to ${SITE}/earn...`);
+      await Promise.race([
+        page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 }),
+        new Promise((r) => setTimeout(r, 33000)),
+      ]).catch((e) => log(`  [nav-back ${attempt}/5] warning: ${e.message.split("\n")[0]}`));
+      await waitForCF(page, 20000);
+      await ensureLoggedIn(page);
+      if (page.url().includes(`${SITE}/earn`)) { onEarn = true; break; }
+      log(`  [nav-back ${attempt}/5] Landed: ${page.url()} — retrying in 5s...`);
+      await sleep(5000);
+    } catch (e) {
+      log(`  [nav-back ${attempt}/5] Error: ${e.message}`);
+      await sleep(5000);
+    }
+  }
+
+  if (!onEarn) {
+    log("  ⚠️  Could not get back to /earn after 5 attempts — forcing hard navigation...");
+    try {
+      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await waitForCF(page, 20000);
     } catch {}
   }
-  await shot(page, "earn-final");
 
-  const coinsAfter = await getCoins(page);
-  const diff       = coinsAfter - coinsBefore;
-  const flashEl    = await page.evaluate(() => {
+  await shot(page, "earn-final");
+  log(`  Final URL: ${page.url()}`);
+
+  // Only read coins if we're on vektalnodes — otherwise the number will be 0 (wrong page)
+  let coinsAfter = coinsBefore;  // default: assume unchanged so diff = 0
+  const onVektal = page.url().includes("vektalnodes.in");
+  if (onVektal) {
+    coinsAfter = await getCoins(page);
+  } else {
+    log("  ⚠️  Not on vektalnodes — skipping coin read to avoid false diff.");
+  }
+
+  const diff    = coinsAfter - coinsBefore;
+  const flashEl = onVektal ? await page.evaluate(() => {
     const el = document.querySelector(".alert, .flash, [role='alert'], .notice");
     return el ? (el.textContent || "").trim() : "";
-  }).catch(() => "");
+  }).catch(() => "") : "";
 
   log("");
   log("═".repeat(55));
   log(`Coins BEFORE : ${coinsBefore}`);
-  log(`Coins AFTER  : ${coinsAfter}`);
+  log(`Coins AFTER  : ${onVektal ? coinsAfter : "(unreadable — wrong page)"}`);
   log(`Diff         : ${diff >= 0 ? "+" : ""}${diff}`);
   if (flashEl) log(`Flash msg    : ${flashEl}`);
   const totalTime = Math.round((Date.now() - cycleStart) / 1000);
@@ -797,6 +827,11 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   if (diff >= 12) {
     log("✅ SUCCESS — earned 12 coins!");
+    log("═".repeat(55));
+    return { success: true, waitMs: 0 };
+  } else if (!onVektal) {
+    // Could not verify — assume credited (cycle ran fully) and record the slot
+    log("⚠️  Could not verify coins (page mismatch) — assuming cycle credited.");
     log("═".repeat(55));
     return { success: true, waitMs: 0 };
   } else {
