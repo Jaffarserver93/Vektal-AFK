@@ -44,6 +44,16 @@ async function sleep(ms, label) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+async function safeGoto(page, url, timeout = 60000) {
+  log(`  [nav] → ${url}`);
+  const nav = page.goto(url, { waitUntil: "domcontentloaded", timeout }).catch((e) => {
+    log(`  [nav] goto warning: ${e.message.split("\n")[0]}`);
+  });
+  const hard = new Promise((r) => setTimeout(r, timeout + 3000));
+  await Promise.race([nav, hard]);
+  log(`  [nav] ✓ landed: ${page.url()}`);
+}
+
 let _stepNum = 0;
 async function shot(page, label) {
   _stepNum++;
@@ -342,9 +352,11 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   // ── STEP 1: Navigate to /earn + status check ─────────────────────────
   log("\n── STEP 1: Navigate to /earn ──");
-  await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await safeGoto(page, `${SITE}/earn`, 60000);
+  log("  [step1] page landed — waiting for CF...");
   await waitForCF(page);
   await sleep(1000);
+  log("  [step1] taking screenshot...");
   await shot(page, "earn-page");
 
   const coinsBefore = await getCoins(page);
@@ -486,7 +498,10 @@ async function runLinkPaysCycle(page, cycleNum) {
         sameStreak++;
         if (sameStreak >= 5) {
           log(`  ⚠️  Stuck on same URL (${sameStreak}×) — reloading...`);
-          await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
+          await Promise.race([
+            page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {}),
+            new Promise((r) => setTimeout(r, 18000)),
+          ]);
           sameStreak = 0;
           await sleep(3000);
           continue;
@@ -566,7 +581,7 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   if (!page.url().includes(`${SITE}/earn`)) {
     try {
-      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await safeGoto(page, `${SITE}/earn`, 30000);
       await waitForCF(page, 15000);
       await sleep(1500);
     } catch {}
@@ -670,11 +685,11 @@ async function runLinkPaysCycle(page, cycleNum) {
 
     // ── Login ─────────────────────────────────────────────────────────
     log("\n── Login ──");
-    await page.goto(SITE, { waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+    await safeGoto(page, SITE, 60000);
     await waitForCF(page, 60000);
     await sleep(1000);
 
-    await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await safeGoto(page, `${SITE}/login`, 60000);
     await waitForCF(page);
     await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 30000 }).catch(() => {});
     await sleep(600);
@@ -682,7 +697,7 @@ async function runLinkPaysCycle(page, cycleNum) {
     let emailEl = await page.$('input[type="email"], input[name="email"]');
     if (!emailEl) {
       log("Email input not found — reloading...");
-      await page.goto(`${SITE}/login`, { waitUntil: "domcontentloaded", timeout: 60000 });
+      await safeGoto(page, `${SITE}/login`, 60000);
       await waitForCF(page); await sleep(800);
       emailEl = await page.$('input[type="email"], input[name="email"]');
     }
@@ -702,14 +717,14 @@ async function runLinkPaysCycle(page, cycleNum) {
     await waitForCF(page);
 
     if (page.url().includes("/login")) {
-      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await safeGoto(page, `${SITE}/earn`, 30000);
       await waitForCF(page);
       if (page.url().includes("/login")) throw new Error("Login failed — still on /login");
     }
     log(`✓ Logged in: ${page.url()}`);
 
     if (!page.url().includes("/earn")) {
-      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await safeGoto(page, `${SITE}/earn`, 30000);
       await waitForCF(page);
     }
 
@@ -751,7 +766,7 @@ async function runLinkPaysCycle(page, cycleNum) {
         // Return to /earn after cycle
         try {
           if (!page.url().includes("vektalnodes.in/earn")) {
-            await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+            await safeGoto(page, `${SITE}/earn`, 30000);
             await waitForCF(page, 15000);
           }
         } catch {}
@@ -764,9 +779,12 @@ async function runLinkPaysCycle(page, cycleNum) {
       // Reload /earn for fresh status
       try {
         if (!page.url().includes(`${SITE}/earn`)) {
-          await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 });
+          await safeGoto(page, `${SITE}/earn`, 30000);
         } else {
-          await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+          await Promise.race([
+            page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {}),
+            new Promise((r) => setTimeout(r, 33000)),
+          ]);
         }
         await waitForCF(page, 10000);
       } catch {}
