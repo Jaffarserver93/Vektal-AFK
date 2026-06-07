@@ -80,15 +80,31 @@ function isSnapChromium(chromePath) {
   } catch { return false; }
 }
 
+function isDisplayAlive(display) {
+  try {
+    execSync(`xdpyinfo -display ${display} > /dev/null 2>&1`);
+    return true;
+  } catch { return false; }
+}
+
 function startXvfb() {
   if (process.env.DISPLAY) {
-    log(`[Xvfb] DISPLAY already set to ${process.env.DISPLAY} — skipping.`);
-    return Promise.resolve(null);
+    if (isDisplayAlive(process.env.DISPLAY)) {
+      log(`[Xvfb] DISPLAY=${process.env.DISPLAY} is active — skipping.`);
+      return Promise.resolve(null);
+    }
+    log(`[Xvfb] DISPLAY=${process.env.DISPLAY} set but not responding — cleaning stale lock and restarting...`);
+    const dispNum = process.env.DISPLAY.replace(":", "");
+    try { execSync(`rm -f /tmp/.X${dispNum}-lock`); } catch {}
+    delete process.env.DISPLAY;
   }
   if (!fs.existsSync(XVFB_PATH)) {
     log("[Xvfb] Not found at /usr/bin/Xvfb — run: sudo apt-get install -y xvfb");
     return Promise.resolve(null);
   }
+  // Clean any stale lock for our target display before starting
+  const dispNum = DISPLAY_NUM.replace(":", "");
+  try { execSync(`rm -f /tmp/.X${dispNum}-lock`); } catch {}
   return new Promise((resolve, reject) => {
     log(`[Xvfb] Starting on display ${DISPLAY_NUM}...`);
     const xvfb = spawn(XVFB_PATH, [DISPLAY_NUM, "-screen", "0", "1280x900x24", "-ac", "+extension", "GLX", "+render", "-noreset"], {
