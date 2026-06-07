@@ -127,7 +127,7 @@ async function keepAlive(page) {
 
       if (!url.includes("vektalnodes.in")) {
         log("Unexpected redirect, going back to earn page...");
-        await page.goto(EARN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.goto(EARN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(3000);
         continue;
       }
@@ -137,7 +137,7 @@ async function keepAlive(page) {
         const ok = await tryLogin(page);
         if (ok) {
           await sleep(3000);
-          await page.goto(EARN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+          await page.goto(EARN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
           await sleep(3000);
         }
         continue;
@@ -165,7 +165,7 @@ async function keepAlive(page) {
 
       if (tick % 5 === 0) {
         log("Reloading earn page to keep session fresh...");
-        await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 });
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
         await sleep(3000);
       }
     } catch (err) {
@@ -215,8 +215,20 @@ async function keepAlive(page) {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-accelerated-2d-canvas",
       "--disable-gpu",
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
+      "--single-process",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--hide-scrollbars",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--safebrowsing-disable-auto-update",
       "--window-size=1280,800",
     ],
   });
@@ -240,7 +252,7 @@ async function keepAlive(page) {
 
   try {
     log(`Opening ${LOGIN_URL} ...`);
-    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
     await sleep(2000);
 
     const currentUrl = page.url();
