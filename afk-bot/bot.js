@@ -180,9 +180,37 @@ async function keepAlive(page) {
   log("=== AFK Bot Starting ===");
   log(`Target: ${BASE_URL}`);
 
+  const { execSync } = require("child_process");
+
+  function findChromium() {
+    if (process.env.CHROMIUM_PATH) return process.env.CHROMIUM_PATH;
+    const candidates = [
+      "/usr/bin/chromium-browser",
+      "/usr/bin/chromium",
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/snap/bin/chromium",
+      "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
+    ];
+    for (const p of candidates) {
+      try { execSync(`test -x "${p}"`); return p; } catch {}
+    }
+    for (const cmd of ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]) {
+      try { return execSync(`which ${cmd}`).toString().trim(); } catch {}
+    }
+    return null;
+  }
+
+  const chromiumPath = findChromium();
+  if (!chromiumPath) {
+    log("[ERROR] No Chromium found. Run: sudo apt install chromium-browser");
+    process.exit(1);
+  }
+  log(`Using Chromium: ${chromiumPath}`);
+
   const browser = await puppeteer.launch({
     headless: "new",
-    executablePath: process.env.CHROMIUM_PATH || "/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
+    executablePath: chromiumPath,
     args: [
       "--no-sandbox",
       "--disable-setuid-sandbox",
