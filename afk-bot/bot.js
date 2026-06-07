@@ -58,7 +58,15 @@ let _stepNum = 0;
 async function shot(page, label) {
   _stepNum++;
   const file = path.join(SCREENSHOTS_DIR, `${String(_stepNum).padStart(2, "0")}-${label}.png`);
-  try { await page.screenshot({ path: file, fullPage: true }); log(`  📸 ${path.basename(file)}`); } catch {}
+  try {
+    await Promise.race([
+      page.screenshot({ path: file, fullPage: true }),
+      new Promise((_, r) => setTimeout(() => r(new Error("screenshot timeout")), 12000)),
+    ]);
+    log(`  📸 ${path.basename(file)}`);
+  } catch (e) {
+    log(`  📸 screenshot skipped (${e.message})`);
+  }
 }
 function resetStepNum() { _stepNum = 0; }
 
