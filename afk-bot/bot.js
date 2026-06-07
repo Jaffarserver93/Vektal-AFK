@@ -25,7 +25,27 @@ const SITE        = "https://vektalnodes.in";
 const EMAIL       = process.env.EMAIL    || process.env.VEKTAL_EMAIL    || "";
 const PASSWORD    = process.env.PASSWORD || process.env.VEKTAL_PASSWORD || "";
 const DISPLAY_NUM = ":94";
-const XVFB_PATH   = "/usr/bin/Xvfb";
+// Dynamically locate Xvfb (supports Nix store paths on Replit)
+function findXvfb() {
+  const candidates = [
+    "/usr/bin/Xvfb",
+    "/usr/local/bin/Xvfb",
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  try {
+    const p = execSync("which Xvfb 2>/dev/null").toString().trim();
+    if (p) return p;
+  } catch {}
+  // Search Nix store
+  try {
+    const p = execSync("find /nix/store -name Xvfb -type f 2>/dev/null | head -1").toString().trim();
+    if (p) return p;
+  } catch {}
+  return null;
+}
+const XVFB_PATH = findXvfb();
 const MAX_DAILY   = 10;
 const MIN_FLOW_S  = 245;
 const SLOT_WINDOW_MS = 24 * 60 * 60 * 1000;  // 24 hours in ms
