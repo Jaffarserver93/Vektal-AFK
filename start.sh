@@ -1,5 +1,4 @@
 #!/bin/bash
-
 set -e
 
 echo "=========================================="
@@ -7,29 +6,38 @@ echo "  AFK Bot - vektalnodes.in/earn"
 echo "=========================================="
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOT_DIR="$SCRIPT_DIR/afk-bot"
 
-echo "[1/5] Checking Node.js..."
-if ! command -v node &>/dev/null; then
-  echo "[ERROR] Node.js not installed. Install from https://nodejs.org"
+# Auto-detect BOT_DIR: works whether run from repo root OR from inside afk-bot/
+if [ -f "$SCRIPT_DIR/bot.js" ]; then
+  BOT_DIR="$SCRIPT_DIR"
+elif [ -f "$SCRIPT_DIR/afk-bot/bot.js" ]; then
+  BOT_DIR="$SCRIPT_DIR/afk-bot"
+else
+  echo "[ERROR] Cannot find bot.js."
+  echo "  Run this script from the repo root or from inside the afk-bot/ folder."
   exit 1
 fi
-node --version
 
-echo "[2/5] Locating .env file..."
+echo "[1/5] Node.js: $(node --version 2>/dev/null || echo 'NOT FOUND')"
+if ! command -v node &>/dev/null; then
+  echo "[ERROR] Node.js not installed. Get it from https://nodejs.org"
+  exit 1
+fi
 
+echo "[2/5] Setting up .env..."
 if [ -f "$BOT_DIR/.env" ]; then
-  echo "Found .env in afk-bot/"
+  echo "  Found .env in $BOT_DIR"
 elif [ -f "$SCRIPT_DIR/.env" ]; then
-  echo "Found .env in repo root — copying into afk-bot/"
+  echo "  Copying .env from $SCRIPT_DIR"
   cp "$SCRIPT_DIR/.env" "$BOT_DIR/.env"
 elif [ -f "$(pwd)/.env" ]; then
-  echo "Found .env in current directory — copying into afk-bot/"
+  echo "  Copying .env from $(pwd)"
   cp "$(pwd)/.env" "$BOT_DIR/.env"
 else
   echo ""
   echo "[ERROR] .env file not found! Create one:"
-  echo "  nano .env"
+  echo "  nano $BOT_DIR/.env"
+  echo ""
   echo "  EMAIL=your@email.com"
   echo "  PASSWORD=yourpassword"
   echo ""
@@ -38,12 +46,10 @@ fi
 
 echo "[3/5] Installing Node dependencies..."
 cd "$BOT_DIR"
-rm -rf node_modules package-lock.json
 PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund
-echo "Dependencies installed."
+echo "  Dependencies installed."
 
-echo "[4/5] Detecting Chrome/Chromium + Xvfb..."
-
+echo "[4/5] Detecting Chrome/Chromium..."
 find_chrome() {
   for candidate in \
     "/usr/bin/google-chrome-stable" \
@@ -51,95 +57,94 @@ find_chrome() {
     "/usr/local/bin/google-chrome" \
     "/usr/bin/chromium" \
     "/usr/bin/chromium-browser"; do
-    if [ -x "$candidate" ]; then
-      if file "$candidate" 2>/dev/null | grep -q "ELF"; then
-        echo "$candidate"
-        return
-      elif [ "$candidate" != "/usr/bin/chromium-browser" ]; then
-        echo "$candidate"
-        return
-      fi
-    fi
+    if [ -x "$candidate" ]; then echo "$candidate"; return; fi
   done
-  for cmd in google-chrome-stable google-chrome chromium; do
+  for cmd in google-chrome-stable google-chrome chromium chromium-browser; do
     path="$(which "$cmd" 2>/dev/null || true)"
-    if [ -n "$path" ] && [ -x "$path" ]; then
-      if ! echo "$path" | grep -q "snap"; then
-        echo "$path"
-        return
-      fi
-    fi
+    if [ -n "$path" ] && [ -x "$path" ]; then echo "$path"; return; fi
   done
+  nix_chrome="$(find /nix/store -name 'chromium' -type f 2>/dev/null | head -1 || true)"
+  if [ -n "$nix_chrome" ]; then echo "$nix_chrome"; return; fi
 }
 
 CHROMIUM_PATH="$(find_chrome)"
-
 if [ -z "$CHROMIUM_PATH" ]; then
-  echo "Chrome not found. Installing Google Chrome..."
-  apt-get update -qq
-  apt-get install -y -qq wget gnupg ca-certificates
-  wget -q -O /tmp/google-chrome.deb \
-    https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-  apt-get install -y -qq /tmp/google-chrome.deb || \
-    dpkg -i /tmp/google-chrome.deb && apt-get -f install -y -qq
-  rm -f /tmp/google-chrome.deb
-  CHROMIUM_PATH="$(find_chrome)"
+  echo "  Chrome not found — trying to install via apt-get..."
+  if command -v apt-get &>/dev/null; then
+    apt-get update -qq
+    apt-get install -y -qq wget gnupg ca-certificates
+    wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+    dpkg -i /tmp/chrome.deb 2>/dev/null || apt-get -f install -y -qq
+    rm -f /tmp/chrome.deb
+    CHROMIUM_PATH="$(find_chrome)"
+  fi
 fi
-
 if [ -z "$CHROMIUM_PATH" ]; then
-  echo ""
-  echo "[ERROR] Could not install Chrome. Try manually:"
-  echo "  wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
-  echo "  dpkg -i google-chrome-stable_current_amd64.deb"
-  echo "  apt-get -f install -y"
+  echo "[ERROR] Chrome not found. Install with: apt-get install -y chromium-browser"
   exit 1
 fi
+echo "  Chrome: $CHROMIUM_PATH"
 
-echo "Using Chrome: $CHROMIUM_PATH"
+echo "[5/5] Detecting Xvfb (virtual display)..."
+find_xvfb() {
+  for candidate in "/usr/bin/Xvfb" "/usr/local/bin/Xvfb"; do
+    if [ -x "$candidate" ]; then echo "$candidate"; return; fi
+  done
+  path="$(which Xvfb 2>/dev/null || true)"
+  if [ -n "$path" ]; then echo "$path"; return; fi
+  nix_xvfb="$(find /nix/store -name 'Xvfb' -type f 2>/dev/null | head -1 || true)"
+  if [ -n "$nix_xvfb" ]; then echo "$nix_xvfb"; return; fi
+}
 
-# Install Xvfb (needed for puppeteer-real-browser headless: false)
-if ! command -v Xvfb &>/dev/null; then
-  echo "Xvfb not found. Installing..."
-  apt-get update -qq
-  apt-get install -y -qq xvfb
+XVFB_PATH="$(find_xvfb)"
+if [ -z "$XVFB_PATH" ]; then
+  echo "  Xvfb not found — trying to install via apt-get..."
+  if command -v apt-get &>/dev/null; then
+    apt-get update -qq && apt-get install -y -qq xvfb
+    XVFB_PATH="$(find_xvfb)"
+  fi
 fi
-echo "Xvfb: $(which Xvfb)"
+if [ -z "$XVFB_PATH" ]; then
+  echo "[ERROR] Xvfb not found. Install with: apt-get install -y xvfb"
+  exit 1
+fi
+echo "  Xvfb: $XVFB_PATH"
 
-echo "[5/5] Starting AFK bot with Xvfb virtual display..."
+echo ""
+echo "Starting virtual display + bot..."
 echo "(Press Ctrl+C to stop)"
 echo ""
 
-# Kill any leftover Xvfb on display :94 and remove stale lock
-echo "Cleaning up any existing Xvfb on :94..."
 pkill -f "Xvfb :94" 2>/dev/null || true
 sleep 1
-rm -f /tmp/.X94-lock /tmp/.X94-unix
+rm -f /tmp/.X94-lock /tmp/.X94-unix 2>/dev/null || true
 
-# Start fresh Xvfb
-Xvfb :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
+"$XVFB_PATH" :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
 XVFB_PID=$!
 sleep 2
 
-# Verify Xvfb actually started
 if ! kill -0 "$XVFB_PID" 2>/dev/null; then
-  echo "[ERROR] Xvfb failed to start. Trying to remove stale lock and retry..."
-  rm -f /tmp/.X94-lock /tmp/.X94-unix
-  Xvfb :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
+  echo "  Xvfb failed — removing stale lock and retrying..."
+  rm -f /tmp/.X94-lock /tmp/.X94-unix 2>/dev/null || true
+  "$XVFB_PATH" :94 -screen 0 1280x900x24 -ac +extension GLX +render -noreset &
   XVFB_PID=$!
   sleep 2
 fi
 
-export DISPLAY=:94
+if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+  echo "[ERROR] Xvfb could not start."
+  exit 1
+fi
 
-echo "Display: $DISPLAY | Chrome: $CHROMIUM_PATH"
-echo ""
+echo "Xvfb running (PID $XVFB_PID)"
 
-# Trap Ctrl+C to cleanly kill Xvfb
 cleanup() {
-  echo ""
   echo "Stopping..."
   kill "$XVFB_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-CHROMIUM_PATH="$CHROMIUM_PATH" DISPLAY="$DISPLAY" node bot.js
+export DISPLAY=:94
+export CHROMIUM_PATH="$CHROMIUM_PATH"
+
+node bot.js
