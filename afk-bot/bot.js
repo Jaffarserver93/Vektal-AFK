@@ -564,10 +564,30 @@ async function doLogin(page) {
   log(`[Login] ✓ Logged in: ${page.url()}`);
 }
 
+// ── forceNavigate — use window.location to bypass ERR_ABORTED from third-party sites ──
+async function forceNavigate(page, url, timeoutMs = 30000) {
+  log(`  [force-nav] → ${url}`);
+  try {
+    await Promise.race([
+      Promise.all([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: timeoutMs }).catch(() => {}),
+        page.evaluate((u) => { window.location.href = u; }, url),
+      ]),
+      new Promise((r) => setTimeout(r, timeoutMs + 3000)),
+    ]);
+    log(`  [force-nav] ✓ landed: ${page.url()}`);
+  } catch (e) {
+    log(`  [force-nav] warning: ${e.message.split("\n")[0]}`);
+  }
+}
+
 // ── ensureLoggedIn — detect session expiry and re-login if needed ─────────────
+// Only re-logins when we are ACTUALLY on the vektalnodes.in login/logout page.
+// Being on a third-party site (bookyourhotel.in, linkpays.in, etc.) is normal and
+// should NOT trigger a re-login — the caller must navigate back first.
 async function ensureLoggedIn(page) {
   const url = page.url();
-  if (url.includes("/login") || url.includes("/logout") || (!url.includes(SITE) && url !== "about:blank")) {
+  if (url.includes("vektalnodes.in") && (url.includes("/login") || url.includes("/logout"))) {
     log(`⚠️  Session expired (landed on ${url}) — re-logging in...`);
     await doLogin(page);
     return true;
@@ -847,10 +867,15 @@ async function runLinkPaysCycle(page, cycleNum) {
     }
 
     log("  Waiting for redirect after Get Link...");
-    // Wait up to 20s for vektalnodes redirect; most of the time it auto-redirects
-    for (let i = 0; i < 20; i++) {
+    // Wait up to 8s for an auto-redirect; bookyourhotel.in often doesn't redirect automatically
+    for (let i = 0; i < 8; i++) {
       await sleep(1000);
       if (page.url().includes("vektalnodes.in")) { log(`  ✓ Redirected to vektalnodes: ${page.url()}`); break; }
+    }
+    // If still on bookyourhotel.in, force-navigate using window.location (page.goto ERR_ABORTs)
+    if (!page.url().includes("vektalnodes.in")) {
+      log(`  Still on ${page.url()} — force-navigating to ${SITE}/earn via window.location...`);
+      await forceNavigate(page, `${SITE}/earn`, 30000);
     }
     log(`  After Get Link wait: ${page.url()}`);
     await shot(page, "hotel-after-get-link");
@@ -860,16 +885,22 @@ async function runLinkPaysCycle(page, cycleNum) {
   log("\n── STEP 7: Final check ──");
   log(`  Current URL: ${page.url()}`);
 
-  // Retry navigating to /earn up to 5 times — ERR_ABORTED is common here
+  // If we're on a third-party site, use window.location to escape (page.goto gets ERR_ABORTED)
   let onEarn = false;
   for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       if (page.url().includes(`${SITE}/earn`)) { onEarn = true; break; }
       log(`  [nav-back ${attempt}/5] Navigating to ${SITE}/earn...`);
-      await Promise.race([
-        page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 }),
-        new Promise((r) => setTimeout(r, 33000)),
-      ]).catch((e) => log(`  [nav-back ${attempt}/5] warning: ${e.message.split("\n")[0]}`));
+      const onThirdParty = !page.url().includes("vektalnodes.in") && page.url() !== "about:blank";
+      if (onThirdParty) {
+        // Use forceNavigate (window.location) to bypass ERR_ABORTED from third-party domains
+        await forceNavigate(page, `${SITE}/earn`, 30000);
+      } else {
+        await Promise.race([
+          page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 }),
+          new Promise((r) => setTimeout(r, 33000)),
+        ]).catch((e) => log(`  [nav-back ${attempt}/5] warning: ${e.message.split("\n")[0]}`));
+      }
       await waitForCF(page, 20000);
       await ensureLoggedIn(page);
       if (page.url().includes(`${SITE}/earn`)) { onEarn = true; break; }
@@ -882,9 +913,9 @@ async function runLinkPaysCycle(page, cycleNum) {
   }
 
   if (!onEarn) {
-    log("  ⚠️  Could not get back to /earn after 5 attempts — forcing hard navigation...");
+    log("  ⚠️  Could not get back to /earn after 5 attempts — trying forceNavigate as last resort...");
     try {
-      await page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await forceNavigate(page, `${SITE}/earn`, 45000);
       await waitForCF(page, 20000);
     } catch {}
   }
@@ -1026,7 +1057,12 @@ async function runLinkPaysCycle(page, cycleNum) {
       try {
         // Ensure we're on /earn before each cycle
         if (!page.url().includes(`${SITE}/earn`)) {
-          await safeGoto(page, `${SITE}/earn`, 30000);
+          const onThirdParty = !page.url().includes("vektalnodes.in") && page.url() !== "about:blank";
+          if (onThirdParty) {
+            await forceNavigate(page, `${SITE}/earn`, 30000);
+          } else {
+            await safeGoto(page, `${SITE}/earn`, 30000);
+          }
           await waitForCF(page, 15000);
           await ensureLoggedIn(page).catch(() => {});
         }
