@@ -144,9 +144,27 @@ async function sleep(ms, label) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ── BrowserDeadError — thrown when the browser session is unrecoverable ───────
+class BrowserDeadError extends Error {
+  constructor(msg) { super(msg); this.name = "BrowserDeadError"; }
+}
+
+// ── isDeadSessionError — detects Puppeteer "session closed / detached frame" ──
+function isDeadSessionError(e) {
+  if (!e || !e.message) return false;
+  return (
+    e.message.includes("detached Frame") ||
+    e.message.includes("Session closed") ||
+    e.message.includes("Target closed") ||
+    (e.message.includes("Protocol error") && e.message.includes("Session closed"))
+  );
+}
+
 async function safeGoto(page, url, timeout = 60000) {
   log(`  [nav] → ${url}`);
   const nav = page.goto(url, { waitUntil: "domcontentloaded", timeout }).catch((e) => {
+    // Dead-session errors must bubble up so the main loop can restart the browser
+    if (isDeadSessionError(e)) throw new BrowserDeadError(`safeGoto dead session: ${e.message.split("\n")[0]}`);
     log(`  [nav] goto warning: ${e.message.split("\n")[0]}`);
   });
   const hard = new Promise((r) => setTimeout(r, timeout + 3000));
@@ -191,7 +209,7 @@ async function shot(page, label) {
   }
 }
 
-// ── ensurePageAlive — reload if renderer crashed after a long CF wait ──────────
+// ── ensurePageAlive — reload if renderer crashed; throw BrowserDeadError if hopeless ──
 async function ensurePageAlive(page, url) {
   try {
     // A simple evaluate confirms the renderer is alive
@@ -211,6 +229,11 @@ async function ensurePageAlive(page, url) {
       await waitForCF(page, 60000);
     } catch (e2) {
       log(`  [health] Reload also failed: ${e2.message}`);
+      // If both health check and reload fail with a dead-session error, the browser
+      // is unrecoverable — signal the main loop to do a full browser restart.
+      if (isDeadSessionError(e) || isDeadSessionError(e2)) {
+        throw new BrowserDeadError(`Browser session is dead (${e2.message})`);
+      }
     }
   }
 }
@@ -945,10 +968,11 @@ async function runLinkPaysCycle(page, cycleNum) {
   process.on("SIGINT",  () => { cleanup(); process.exit(0); });
   process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 
-  try {
+  // ── launchBrowser — reusable; called on startup and after dead-session restarts ──
+  async function launchBrowser() {
     log("Launching browser (puppeteer-real-browser)...");
-    let result;
     const BROWSER_RETRIES = 3;
+    let result;
     for (let attempt = 1; attempt <= BROWSER_RETRIES; attempt++) {
       try {
         result = await connect({
@@ -971,11 +995,16 @@ async function runLinkPaysCycle(page, cycleNum) {
         }
       }
     }
-    browser = result.browser;
-    page    = result.page;
-    page.setDefaultNavigationTimeout(90000);
-    page.on("dialog", async (d) => { log(`Dialog: ${d.message()}`); await d.dismiss(); });
+    const newBrowser = result.browser;
+    const newPage    = result.page;
+    newPage.setDefaultNavigationTimeout(90000);
+    newPage.on("dialog", async (d) => { log(`Dialog: ${d.message()}`); await d.dismiss(); });
     log("Browser launched ✓");
+    return { browser: newBrowser, page: newPage };
+  }
+
+  try {
+    ({ browser, page } = await launchBrowser());
 
     // ── Login ─────────────────────────────────────────────────────────
     log("\n── Login ──");
@@ -1010,8 +1039,31 @@ async function runLinkPaysCycle(page, cycleNum) {
           log(`[Tick ${cycleNum}] ⚠️  Cycle did not earn coins (site may be at daily limit). Waiting ${CYCLE_INTERVAL_MS / 1000}s...`);
         }
       } catch (err) {
+        // ── Dead browser: close the old one and start fresh ──────────
+        if (err instanceof BrowserDeadError || isDeadSessionError(err)) {
+          log(`[Tick ${cycleNum}] 💀 Browser session is dead — restarting browser...`);
+          try { await browser.close(); } catch {}
+          await sleep(3000);
+          try {
+            ({ browser, page } = await launchBrowser());
+            log("[Browser] ✓ Restarted — logging in again...");
+            await safeGoto(page, SITE, 60000);
+            await waitForCF(page, 60000);
+            await sleep(1000);
+            await doLogin(page);
+            log("[Browser] ✓ Re-logged in after restart.");
+          } catch (restartErr) {
+            log(`[Browser] Restart failed: ${restartErr.message} — waiting 60s before next cycle.`);
+            await sleep(60_000);
+          }
+          // Don't sleep the full interval — retry the cycle soon
+          log(`[Tick ${cycleNum}] Browser restarted — retrying cycle in 15s...`);
+          await sleep(15_000);
+          continue;
+        }
+
         log(`[Tick ${cycleNum}] ERROR: ${err.message}`);
-        // On error, ensure we're back on earn page
+        // On non-fatal error, try to get back to earn page
         try {
           await safeGoto(page, `${SITE}/earn`, 30000);
           await waitForCF(page, 15000);
