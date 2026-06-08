@@ -801,7 +801,25 @@ async function runLinkPaysCycle(browser, page, cycleNum) {
     // Once 4 ad pages are done, wait for bookyourhotel.in redirect
     if (adPagesDone >= MAX_AD_PAGES) {
       totalStuckMs += 3000;
-      if (totalStuckMs >= 45_000) {
+      // After 18s stuck on same article, try clicking NEXT to advance the chain
+      if (totalStuckMs === 18_000 && u === prevLoopUrl) {
+        const clicked = await adPage.evaluate(() => {
+          const candidates = Array.from(document.querySelectorAll("a, button, span"));
+          for (const el of candidates) {
+            const t = (el.innerText || el.textContent || "").trim().toUpperCase();
+            if (t === "NEXT" || t.startsWith("NEXT ") || t === "CONTINUE") {
+              el.click(); return t;
+            }
+          }
+          return null;
+        }).catch(() => null);
+        if (clicked) {
+          log(`  → Clicked article-chain link: "${clicked}" — waiting for hotel redirect...`);
+          await sleep(5000);
+          continue;
+        }
+      }
+      if (totalStuckMs >= 90_000) {
         log(`  ⚠️  Still not on bookyourhotel.in after ${totalStuckMs / 1000}s — navigating directly...`);
         await safeGoto(adPage, "https://bookyourhotel.in/", 30000);
         break;
@@ -843,6 +861,32 @@ async function runLinkPaysCycle(browser, page, cycleNum) {
       if (AD_DOMAINS.some((d) => u.includes(d)) && u === prevLoopUrl) {
         sameStreak++;
         if (sameStreak >= 3) {
+          if (adPagesDone >= 3) {
+            // 3 real ad pages done + stuck on article (no tp- elements).
+            // This article IS the 4th stop — server auto-redirects to bookyourhotel.in
+            // after time is spent on the page. Wait up to 90s for that redirect.
+            log(`  ⏳ ${adPagesDone} real ad pages done — waiting on article for bookyourhotel.in auto-redirect (up to 90s)...`);
+            let redirected = false;
+            for (let w = 0; w < 30; w++) {
+              await sleep(3000);
+              const nowUrl = adPage.url();
+              if (nowUrl.includes("bookyourhotel.in")) {
+                log(`  ✓ bookyourhotel.in redirect detected after ${(w + 1) * 3}s`);
+                redirected = true;
+                break;
+              }
+              if (nowUrl !== u) {
+                log(`  URL changed to ${nowUrl} — continuing loop`);
+                break;
+              }
+              if ((w + 1) % 5 === 0) log(`  Still waiting... ${(w + 1) * 3}s`);
+            }
+            if (redirected) break;
+            // Not redirected — force-navigate to bookyourhotel.in directly
+            log(`  No auto-redirect after 90s — navigating directly to bookyourhotel.in`);
+            adPagesDone++; // count the article as the 4th visit
+            break;
+          }
           log(`  ⚠️  Stuck on ad domain ${sameStreak}× — force-handling as ad page...`);
           adPagesDone++;
           await handleAdPage(adPage, `p${adPagesDone}-forced`);
@@ -875,10 +919,11 @@ async function runLinkPaysCycle(browser, page, cycleNum) {
   log("\n── STEP 6: bookyourhotel.in (final gateway) ──");
 
   // Post-loop safety: navigate directly if ad loop finished without landing on hotel
+  // Trigger if 3+ real ad pages done (4th page is sometimes a pass-through article)
   {
     const u = adPage.url();
-    if (adPagesDone >= MAX_AD_PAGES && !u.includes("bookyourhotel.in") && !u.includes("vektalnodes.in")) {
-      log(`  ⚠️  Loop exited but still on ${u} — navigating directly to bookyourhotel.in...`);
+    if (adPagesDone >= 3 && !u.includes("bookyourhotel.in") && !u.includes("vektalnodes.in")) {
+      log(`  ⚠️  Loop exited (${adPagesDone} ad pages done) but still on ${u} — navigating directly to bookyourhotel.in...`);
       await safeGoto(adPage, "https://bookyourhotel.in/", 30000);
       await sleep(3000);
     }
@@ -926,8 +971,32 @@ async function runLinkPaysCycle(browser, page, cycleNum) {
 
     if (gotLink) log(`  ✓ Clicked Get Link: "${gotLink}"`);
     else {
-      log("  ✗ Get Link not found by text — trying CSS fallback...");
-      await clickButton(adPage, ["#get-link", ".get-link-btn", "[id*='get']", "[class*='get-link']"], [], "Get Link CSS");
+      // Dump all clickable text so we can see what's on the page
+      const pageLinks = await adPage.evaluate(() =>
+        Array.from(document.querySelectorAll("a, button")).map(el =>
+          (el.innerText || el.textContent || "").trim().substring(0, 60)
+        ).filter(Boolean)
+      ).catch(() => []);
+      log(`  ✗ Get Link not found. Page clickables: ${JSON.stringify(pageLinks.slice(0, 10))}`);
+      // Try broader text match — any link containing "get" and "link"
+      const fallback = await adPage.evaluate(() => {
+        const all = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
+        for (const el of all) {
+          const txt = ((el.innerText || el.value || el.textContent) || "").trim().toLowerCase();
+          if (txt.includes("get") && txt.includes("link")) {
+            el.click(); return el.innerText || el.value || txt;
+          }
+        }
+        // CSS fallback — prefer specific IDs first
+        const order = ["#get-link", ".get-link-btn", "[class*='get-link']", "a[href*='earn']", "a[href*='vektal']"];
+        for (const sel of order) {
+          const el = document.querySelector(sel);
+          if (el) { el.click(); return sel; }
+        }
+        return null;
+      }).catch(() => null);
+      if (fallback) log(`  ✓ Clicked Get Link fallback: "${fallback}"`);
+      else log("  ✗ No Get Link found at all — waiting for timeout redirect...");
     }
 
     log("  Waiting for redirect after Get Link...");
