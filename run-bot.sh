@@ -23,30 +23,40 @@ if ! command -v node &>/dev/null; then
   exit 1
 fi
 
-echo "[2/5] Setting up .env..."
-if [ -f "$BOT_DIR/.env" ]; then
+echo "[2/5] Setting up credentials..."
+# Priority: Replit secrets (already in env) > .env file in bot dir > .env file next to script
+if [ -n "$EMAIL" ] && [ -n "$PASSWORD" ]; then
+  echo "  Using EMAIL/PASSWORD from environment (Replit secrets)"
+elif [ -f "$BOT_DIR/.env" ]; then
   echo "  Found .env in $BOT_DIR"
+  set -o allexport; source "$BOT_DIR/.env"; set +o allexport
 elif [ -f "$SCRIPT_DIR/.env" ]; then
   echo "  Copying .env from $SCRIPT_DIR"
   cp "$SCRIPT_DIR/.env" "$BOT_DIR/.env"
+  set -o allexport; source "$BOT_DIR/.env"; set +o allexport
 elif [ -f "$(pwd)/.env" ]; then
   echo "  Copying .env from $(pwd)"
   cp "$(pwd)/.env" "$BOT_DIR/.env"
+  set -o allexport; source "$(pwd)/.env"; set +o allexport
 else
   echo ""
-  echo "[ERROR] No .env file found! Create one with:"
-  echo "  nano $BOT_DIR/.env"
-  echo ""
-  echo "  EMAIL=your@email.com"
-  echo "  PASSWORD=yourpassword"
+  echo "[ERROR] No credentials found! Set EMAIL and PASSWORD via:"
+  echo "  Option 1 (Replit): Add EMAIL and PASSWORD to Secrets (padlock icon)"
+  echo "  Option 2 (terminal): Create $BOT_DIR/.env with:"
+  echo "    EMAIL=your@email.com"
+  echo "    PASSWORD=yourpassword"
   echo ""
   exit 1
 fi
 
+if [ -z "$EMAIL" ] || [ -z "$PASSWORD" ]; then
+  echo "[ERROR] EMAIL or PASSWORD is empty after loading credentials."
+  exit 1
+fi
+echo "  Credentials loaded for: $EMAIL"
+
 echo "[3/5] Installing Node dependencies..."
 cd "$BOT_DIR"
-# Delete any Replit-generated lockfile — it has all resolved URLs hardcoded to
-# package-firewall.replit.local which npm fetches directly, bypassing --registry
 rm -f package-lock.json
 PUPPETEER_SKIP_DOWNLOAD=true npm install --no-audit --no-fund --registry https://registry.npmjs.org
 echo "  Dependencies installed."
@@ -69,7 +79,6 @@ find_chrome() {
       echo "$path"; return
     fi
   done
-  # Nix store search (Replit)
   nix_chrome="$(find /nix/store -name 'chromium' -type f 2>/dev/null | head -1 || true)"
   if [ -n "$nix_chrome" ]; then echo "$nix_chrome"; return; fi
 }
@@ -124,7 +133,6 @@ echo "Starting virtual display + bot..."
 echo "(Press Ctrl+C to stop)"
 echo ""
 
-# Kill any existing Xvfb on :94 and clean stale locks
 pkill -f "Xvfb :94" 2>/dev/null || true
 sleep 1
 rm -f /tmp/.X94-lock /tmp/.X94-unix 2>/dev/null || true
