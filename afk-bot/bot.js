@@ -596,7 +596,7 @@ async function ensureLoggedIn(page) {
 }
 
 // ── runLinkPaysCycle — exact flow from test-linkpays.js ──────────────────────
-async function runLinkPaysCycle(page, cycleNum) {
+async function runLinkPaysCycle(browser, page, cycleNum) {
   resetStepNum();
   log(`\n${"═".repeat(55)}`);
   log(`LINKPAYS CYCLE ${cycleNum} START`);
@@ -644,7 +644,7 @@ async function runLinkPaysCycle(page, cycleNum) {
 
   const cycleStart = Date.now();
 
-  // ── STEP 2: Click "Open LinkPays" ───────────────────────────────────
+  // ── STEP 2: Click "Open LinkPays" — detect new tab ──────────────────
   log("\n── STEP 2: Click Open LinkPays ──");
   const lpBtn = await page.$('button.button-primary[type="submit"], button.button.button-primary');
   if (!lpBtn) {
@@ -652,25 +652,93 @@ async function runLinkPaysCycle(page, cycleNum) {
     return { success: false, waitMs: 30_000 };
   }
 
-  log("  Clicking button — POST /earn/linkpays/start will fire + redirect to linkpays.in...");
-  await lpBtn.click();
+  // Inspect the form — log target/method so we know what to expect
+  const btnInfo = await page.evaluate(() => {
+    const btn = document.querySelector('button.button-primary[type="submit"], button.button.button-primary');
+    if (!btn) return null;
+    const form = btn.closest("form");
+    return {
+      btnText: btn.innerText.trim(),
+      btnType: btn.type,
+      formAction: form ? form.action : null,
+      formTarget: form ? form.target : null,
+      formMethod: form ? form.method : null,
+    };
+  }).catch(() => null);
+  log(`  Button info: ${JSON.stringify(btnInfo)}`);
 
-  log("  Waiting for MAIN TAB to navigate to linkpays.in...");
-  let linkpaysUrl;
-  try {
-    linkpaysUrl = await waitForUrl(page, ["linkpays.in"], 20000, "main-tab");
-  } catch {
-    log(`  Current URL: ${page.url()} — did not reach linkpays.in in 20s`);
-    return { success: false, waitMs: 30_000 };
+  // The form POSTs to /earn/linkpays/start (no target="_blank").
+  // The server response redirects to linkpays.in — so the MAIN TAB navigates.
+  // We just need to click and wait for the navigation away from /earn.
+
+  // Register new-tab listener first (in case behaviour changes)
+  const newTabPromise = new Promise((resolve) => {
+    browser.once("targetcreated", (target) => resolve(target));
+  });
+
+  log("  Clicking LinkPays button and waiting for navigation...");
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 25000 }).catch(() => {}),
+    lpBtn.click(),
+  ]);
+  log(`  Post-click URL: ${page.url()}`);
+
+  // Determine which page carries the flow
+  let adPage = page;
+
+  if (page.url().includes("vektalnodes.in/earn")) {
+    // Still on /earn — server rejected or redirected back (slot exhausted, rate-limit, etc.)
+    // Check if a new tab appeared instead
+    try {
+      const newTarget = await Promise.race([
+        newTabPromise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("no new tab")), 5000)),
+      ]);
+      const newPage = await newTarget.page();
+      if (newPage && !newPage.url().includes("vektalnodes.in/earn")) {
+        log(`  ✓ New tab detected: ${newPage.url()} — switching`);
+        adPage = newPage;
+        adPage.setDefaultNavigationTimeout(90000);
+        adPage.on("dialog", async (d) => { log(`Dialog (adPage): ${d.message()}`); await d.dismiss(); });
+      } else {
+        // Check if server sent back a rejection flash message
+        const flash = await page.evaluate(() => {
+          const el = document.querySelector(".alert, .flash, [role='alert'], .notice, .error");
+          return el ? el.textContent.trim() : "";
+        }).catch(() => "");
+        log(`  Server rejected submit (still on /earn). Flash: "${flash || "(none)"}"`);
+        log("  Slot not available server-side — retrying in 5 minutes.");
+        return { success: false, waitMs: 300_000 };
+      }
+    } catch {
+      const flash = await page.evaluate(() => {
+        const el = document.querySelector(".alert, .flash, [role='alert'], .notice, .error");
+        return el ? el.textContent.trim() : "";
+      }).catch(() => "");
+      log(`  Still on /earn, no new tab. Flash: "${flash || "(none)"}". Slot unavailable — retrying in 5 minutes.`);
+      return { success: false, waitMs: 300_000 };
+    }
+  } else {
+    log(`  Main tab navigated to: ${page.url()}`);
   }
-  log(`  ✓ On linkpays.in: ${linkpaysUrl}`);
-  await waitForCF(page, 30000);
-  await sleep(1000);
-  await shot(page, "linkpays-page");
 
-  // ── STEP 3: proceed() on linkpays.in ────────────────────────────────
-  log("\n── STEP 3: proceed() on linkpays.in ──");
-  const proceedTarget = await page.evaluate(() => {
+  // ── STEP 3: Wait for linkpays.in on adPage + proceed() ───────────────
+  log("\n── STEP 3: linkpays.in + proceed() ──");
+  log(`  Working on tab: ${adPage.url()}`);
+
+  // Wait for linkpays.in to load (it may already be there if new tab was fast)
+  try {
+    await waitForUrl(adPage, ["linkpays.in"], 20000, "linkpays-tab");
+  } catch {
+    log(`  Tab URL: ${adPage.url()} — proceeding anyway`);
+  }
+  log(`  ✓ On linkpays.in: ${adPage.url()}`);
+  await waitForCF(adPage, 30000);
+  await sleep(1000);
+  await shot(adPage, "linkpays-page");
+
+  // Extract proceed() target URL from page scripts
+  const proceedTarget = await adPage.evaluate(() => {
     const scripts = Array.from(document.querySelectorAll("script"));
     for (const s of scripts) {
       const m = (s.textContent || "").match(/atob\("([A-Za-z0-9+/=]+)"\)/);
@@ -678,10 +746,10 @@ async function runLinkPaysCycle(page, cycleNum) {
     }
     return "";
   }).catch(() => "");
-  log(`  proceed() target: ${proceedTarget || "(not found yet)"}`);
+  log(`  proceed() target: ${proceedTarget || "(not found)"}`);
 
   await sleep(4000, "auto-proceed timer");
-  const proceedCalled = await page.evaluate(() => {
+  const proceedCalled = await adPage.evaluate(() => {
     if (typeof proceed === "function") { proceed(); return true; }
     return false;
   }).catch(() => false);
@@ -691,21 +759,21 @@ async function runLinkPaysCycle(page, cycleNum) {
   log("\n── STEP 4: Navigate to ad site ──");
   let adSiteUrl;
   try {
-    adSiteUrl = await waitForUrl(page, ["evspec.in", "rank1st.in", "savepe.in", "bookyourhotel.in", "earn/linkpays/complete"], 30000, "ad-site");
+    adSiteUrl = await waitForUrl(adPage, ["evspec.in", "rank1st.in", "savepe.in", "bookyourhotel.in", "earn/linkpays/complete"], 30000, "ad-site");
   } catch {
-    const u = page.url();
+    const u = adPage.url();
     log(`  WARNING: Still on ${u} — checking if still linkpays.in...`);
     if (u.includes("linkpays.in")) {
-      await clickButton(page, ["button.btn", "a.btn", ".btn"], ["continue", "next step"], "Continue to next step");
+      await clickButton(adPage, ["button.btn", "a.btn", ".btn"], ["continue", "next step"], "Continue to next step");
       await sleep(5000);
-      adSiteUrl = page.url();
+      adSiteUrl = adPage.url();
       log(`  After continue click: ${adSiteUrl}`);
     } else {
       adSiteUrl = u;
     }
   }
   log(`  ✓ Ad site: ${adSiteUrl}`);
-  await shot(page, "ad-site-start");
+  await shot(adPage, "ad-site-start");
 
   // ── STEP 5: Ad page loop (max 4 pages) ──────────────────────────────
   log("\n── STEP 5: Ad page loop ──");
@@ -714,7 +782,7 @@ async function runLinkPaysCycle(page, cycleNum) {
   let adPagesDone = 0, prevLoopUrl = "", sameStreak = 0, totalStuckMs = 0;
 
   for (let i = 1; i <= 40; i++) {
-    const u = page.url();
+    const u = adPage.url();
     log(`\n  [loop ${i}] URL: ${u}`);
 
     if (u.includes("vektalnodes.in"))   { log("  ✓ Back on vektalnodes.in!"); break; }
@@ -724,19 +792,18 @@ async function runLinkPaysCycle(page, cycleNum) {
       log("  Google vignette — waiting up to 10s for auto-redirect...");
       for (let j = 0; j < 10; j++) {
         await sleep(1000);
-        const nu = page.url();
+        const nu = adPage.url();
         if (!nu.includes("google_vignette")) { log(`  → Redirected to: ${nu}`); break; }
       }
       continue;
     }
 
     // Once 4 ad pages are done, wait for bookyourhotel.in redirect
-    // If stuck >45s after that, navigate directly (loop max=40 so 180s is never reached)
     if (adPagesDone >= MAX_AD_PAGES) {
       totalStuckMs += 3000;
       if (totalStuckMs >= 45_000) {
         log(`  ⚠️  Still not on bookyourhotel.in after ${totalStuckMs / 1000}s — navigating directly...`);
-        await safeGoto(page, "https://bookyourhotel.in/", 30000);
+        await safeGoto(adPage, "https://bookyourhotel.in/", 30000);
         break;
       }
       log(`  ✅ ${MAX_AD_PAGES} ad pages complete — waiting for bookyourhotel.in redirect... (${totalStuckMs / 1000}s)`);
@@ -744,8 +811,8 @@ async function runLinkPaysCycle(page, cycleNum) {
       continue;
     }
 
-    // Check for tp- ad elements — wait up to 12s for them to appear before giving up
-    let isAd = await page.evaluate(() => !!(
+    // Check for tp- ad elements — wait up to 12s for them to appear
+    let isAd = await adPage.evaluate(() => !!(
       document.querySelector("button.tp-unlock-btn") ||
       document.querySelector("button.tp-btn") ||
       document.querySelector(".tp-unlock-btn") ||
@@ -756,15 +823,14 @@ async function runLinkPaysCycle(page, cycleNum) {
       log(`  No tp- elements yet on ad domain — waiting up to 12s for page to finish loading...`);
       for (let w = 0; w < 12; w++) {
         await sleep(1000);
-        isAd = await page.evaluate(() => !!(
+        isAd = await adPage.evaluate(() => !!(
           document.querySelector("button.tp-unlock-btn") ||
           document.querySelector("button.tp-btn") ||
           document.querySelector(".tp-unlock-btn") ||
           document.querySelector("[class*='tp-']")
         )).catch(() => false);
         if (isAd) { log(`  tp- elements appeared after ${w + 1}s ✓`); break; }
-        // Also break early if URL changed
-        if (page.url() !== u) { log(`  URL changed during wait — continuing loop`); break; }
+        if (adPage.url() !== u) { log(`  URL changed during wait — continuing loop`); break; }
       }
     }
 
@@ -772,15 +838,14 @@ async function runLinkPaysCycle(page, cycleNum) {
       sameStreak = 0;
       adPagesDone++;
       log(`  → Ad page ${adPagesDone}/${MAX_AD_PAGES}`);
-      await handleAdPage(page, `p${adPagesDone}`);
+      await handleAdPage(adPage, `p${adPagesDone}`);
     } else {
-      // On a known ad domain but tp- never appeared — treat as ad page, try buttons anyway
       if (AD_DOMAINS.some((d) => u.includes(d)) && u === prevLoopUrl) {
         sameStreak++;
         if (sameStreak >= 3) {
           log(`  ⚠️  Stuck on ad domain ${sameStreak}× — force-handling as ad page...`);
           adPagesDone++;
-          await handleAdPage(page, `p${adPagesDone}-forced`);
+          await handleAdPage(adPage, `p${adPagesDone}-forced`);
           sameStreak = 0;
           continue;
         }
@@ -788,11 +853,10 @@ async function runLinkPaysCycle(page, cycleNum) {
         sameStreak = 0;
       } else {
         sameStreak++;
-        // Hard reload if very stuck (non-ad domain)
         if (sameStreak >= 5) {
           log(`  ⚠️  Stuck on same non-ad URL (${sameStreak}×) — reloading...`);
           await Promise.race([
-            page.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {}),
+            adPage.reload({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {}),
             new Promise((r) => setTimeout(r, 18000)),
           ]);
           sameStreak = 0;
@@ -810,29 +874,29 @@ async function runLinkPaysCycle(page, cycleNum) {
   // ── STEP 6: bookyourhotel.in — Get Link ─────────────────────────────
   log("\n── STEP 6: bookyourhotel.in (final gateway) ──");
 
-  // Post-loop safety: if 4 ad pages done but redirect to bookyourhotel never came, go there directly
+  // Post-loop safety: navigate directly if ad loop finished without landing on hotel
   {
-    const u = page.url();
+    const u = adPage.url();
     if (adPagesDone >= MAX_AD_PAGES && !u.includes("bookyourhotel.in") && !u.includes("vektalnodes.in")) {
       log(`  ⚠️  Loop exited but still on ${u} — navigating directly to bookyourhotel.in...`);
-      await safeGoto(page, "https://bookyourhotel.in/", 30000);
+      await safeGoto(adPage, "https://bookyourhotel.in/", 30000);
       await sleep(3000);
     }
   }
 
   let onHotel = false;
   for (let i = 0; i < 20; i++) {
-    const u = page.url();
+    const u = adPage.url();
     if (u.includes("bookyourhotel.in")) { onHotel = true; break; }
     if (u.includes("vektalnodes.in"))   { log(`  Already back on vektalnodes: ${u}`); break; }
     await sleep(1000);
   }
 
   if (onHotel) {
-    log(`  On bookyourhotel.in: ${page.url()}`);
-    await shot(page, "hotel-start");
+    log(`  On bookyourhotel.in: ${adPage.url()}`);
+    await shot(adPage, "hotel-start");
 
-    await waitForCountdown(page, 50000, "hotel", 30000);
+    await waitForCountdown(adPage, 50000, "hotel", 30000);
 
     const elapsed = Math.floor((Date.now() - cycleStart) / 1000);
     if (elapsed < MIN_FLOW_S) {
@@ -843,9 +907,9 @@ async function runLinkPaysCycle(page, cycleNum) {
       log(`  Total elapsed: ${elapsed}s — past 240s minimum ✓`);
     }
 
-    await shot(page, "hotel-after-wait");
+    await shot(adPage, "hotel-after-wait");
 
-    const gotLink = await page.evaluate(() => {
+    const gotLink = await adPage.evaluate(() => {
       const all = Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit]"));
       for (const el of all) {
         const txt = ((el.innerText || el.value || el.textContent) || "").trim().toLowerCase();
@@ -863,61 +927,45 @@ async function runLinkPaysCycle(page, cycleNum) {
     if (gotLink) log(`  ✓ Clicked Get Link: "${gotLink}"`);
     else {
       log("  ✗ Get Link not found by text — trying CSS fallback...");
-      await clickButton(page, ["#get-link", ".get-link-btn", "[id*='get']", "[class*='get-link']"], [], "Get Link CSS");
+      await clickButton(adPage, ["#get-link", ".get-link-btn", "[id*='get']", "[class*='get-link']"], [], "Get Link CSS");
     }
 
     log("  Waiting for redirect after Get Link...");
-    // Wait up to 8s for an auto-redirect; bookyourhotel.in often doesn't redirect automatically
     for (let i = 0; i < 8; i++) {
       await sleep(1000);
-      if (page.url().includes("vektalnodes.in")) { log(`  ✓ Redirected to vektalnodes: ${page.url()}`); break; }
+      if (adPage.url().includes("vektalnodes.in")) { log(`  ✓ Redirected to vektalnodes: ${adPage.url()}`); break; }
     }
-    // If still on bookyourhotel.in, force-navigate using window.location (page.goto ERR_ABORTs)
-    if (!page.url().includes("vektalnodes.in")) {
-      log(`  Still on ${page.url()} — force-navigating to ${SITE}/earn via window.location...`);
-      await forceNavigate(page, `${SITE}/earn`, 30000);
+    // bookyourhotel.in blocks page.goto — use window.location instead
+    if (!adPage.url().includes("vektalnodes.in")) {
+      log(`  Still on ${adPage.url()} — force-navigating via window.location...`);
+      await forceNavigate(adPage, `${SITE}/earn`, 30000);
     }
-    log(`  After Get Link wait: ${page.url()}`);
-    await shot(page, "hotel-after-get-link");
+    log(`  After Get Link: ${adPage.url()}`);
+    await shot(adPage, "hotel-after-get-link");
   }
 
-  // ── STEP 7: Final — force back to /earn, then verify coins ──────────
+  // ── STEP 7: Close ad tab, verify coins on main earn tab ──────────────
   log("\n── STEP 7: Final check ──");
-  log(`  Current URL: ${page.url()}`);
 
-  // If we're on a third-party site, use window.location to escape (page.goto gets ERR_ABORTED)
-  let onEarn = false;
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    try {
-      if (page.url().includes(`${SITE}/earn`)) { onEarn = true; break; }
-      log(`  [nav-back ${attempt}/5] Navigating to ${SITE}/earn...`);
-      const onThirdParty = !page.url().includes("vektalnodes.in") && page.url() !== "about:blank";
-      if (onThirdParty) {
-        // Use forceNavigate (window.location) to bypass ERR_ABORTED from third-party domains
-        await forceNavigate(page, `${SITE}/earn`, 30000);
-      } else {
-        await Promise.race([
-          page.goto(`${SITE}/earn`, { waitUntil: "domcontentloaded", timeout: 30000 }),
-          new Promise((r) => setTimeout(r, 33000)),
-        ]).catch((e) => log(`  [nav-back ${attempt}/5] warning: ${e.message.split("\n")[0]}`));
-      }
-      await waitForCF(page, 20000);
-      await ensureLoggedIn(page);
-      if (page.url().includes(`${SITE}/earn`)) { onEarn = true; break; }
-      log(`  [nav-back ${attempt}/5] Landed: ${page.url()} — retrying in 5s...`);
-      await sleep(5000);
-    } catch (e) {
-      log(`  [nav-back ${attempt}/5] Error: ${e.message}`);
-      await sleep(5000);
-    }
+  // Close the ad tab if it's a separate tab from the main one
+  if (adPage !== page) {
+    try { await adPage.close(); log("  Ad tab closed ✓"); } catch {}
   }
 
-  if (!onEarn) {
-    log("  ⚠️  Could not get back to /earn after 5 attempts — trying forceNavigate as last resort...");
-    try {
-      await forceNavigate(page, `${SITE}/earn`, 45000);
-      await waitForCF(page, 20000);
-    } catch {}
+  // Main tab should still be on /earn — reload it to get fresh coin count
+  log(`  Main tab URL: ${page.url()}`);
+  if (!page.url().includes(`${SITE}/earn`)) {
+    log(`  Main tab left /earn — navigating back...`);
+    await safeGoto(page, `${SITE}/earn`, 30000);
+    await waitForCF(page, 20000);
+    await ensureLoggedIn(page);
+  } else {
+    // Reload to get the updated coin balance
+    await Promise.race([
+      page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }),
+      new Promise((r) => setTimeout(r, 33000)),
+    ]).catch(() => {});
+    await waitForCF(page, 15000);
   }
 
   await shot(page, "earn-final");
@@ -926,13 +974,19 @@ async function runLinkPaysCycle(page, cycleNum) {
   // Only read coins if we're on vektalnodes — otherwise the number will be 0 (wrong page)
   let coinsAfter = coinsBefore;  // default: assume unchanged so diff = 0
   const onVektal = page.url().includes("vektalnodes.in");
+  let statusAfter = null;
   if (onVektal) {
     coinsAfter = await getCoins(page);
+    statusAfter = await getLinkPaysStatus(page).catch(() => null);
   } else {
     log("  ⚠️  Not on vektalnodes — skipping coin read to avoid false diff.");
   }
 
-  const diff    = coinsAfter - coinsBefore;
+  const diff = coinsAfter - coinsBefore;
+  // Slot consumed = usage count went up (or down, since it counts remaining) — detect either direction
+  const slotConsumed = statusAfter
+    ? (statusAfter.usageToday !== status.usageToday)
+    : false;
   const flashEl = onVektal ? await page.evaluate(() => {
     const el = document.querySelector(".alert, .flash, [role='alert'], .notice");
     return el ? (el.textContent || "").trim() : "";
@@ -943,6 +997,7 @@ async function runLinkPaysCycle(page, cycleNum) {
   log(`Coins BEFORE : ${coinsBefore}`);
   log(`Coins AFTER  : ${onVektal ? coinsAfter : "(unreadable — wrong page)"}`);
   log(`Diff         : ${diff >= 0 ? "+" : ""}${diff}`);
+  if (statusAfter) log(`Slot usage   : ${status.usageToday}/10 → ${statusAfter.usageToday}/10 ${slotConsumed ? "✅ consumed" : "(unchanged)"}`);
   if (flashEl) log(`Flash msg    : ${flashEl}`);
   const totalTime = Math.round((Date.now() - cycleStart) / 1000);
   log(`Total time   : ${totalTime}s`);
@@ -952,12 +1007,16 @@ async function runLinkPaysCycle(page, cycleNum) {
     log("═".repeat(55));
     return { success: true, waitMs: 0 };
   } else if (!onVektal) {
-    // Could not verify — assume credited (cycle ran fully) and record the slot
     log("⚠️  Could not verify coins (page mismatch) — assuming cycle credited.");
     log("═".repeat(55));
     return { success: true, waitMs: 0 };
+  } else if (slotConsumed) {
+    // Slot was consumed but coin counter hasn't updated yet (common — server credits asynchronously)
+    log(`⚠️  Coin counter not updated yet (+${diff}) but slot was consumed — cycle credited ✅`);
+    log("═".repeat(55));
+    return { success: true, waitMs: 0 };
   } else {
-    log(`⚠️  Coin diff ${diff} — cycle may not have been credited.`);
+    log(`⚠️  Coin diff ${diff}, slot unchanged — cycle may not have been credited.`);
     log("═".repeat(55));
     return { success: false, waitMs: 60_000 };
   }
@@ -1067,7 +1126,7 @@ async function runLinkPaysCycle(page, cycleNum) {
           await ensureLoggedIn(page).catch(() => {});
         }
 
-        const res = await runLinkPaysCycle(page, cycleNum);
+        const res = await runLinkPaysCycle(browser, page, cycleNum);
 
         if (res.success) {
           log(`[Tick ${cycleNum}] ✅ Cycle complete — earned 12 coins. Waiting ${CYCLE_INTERVAL_MS / 1000}s...`);
